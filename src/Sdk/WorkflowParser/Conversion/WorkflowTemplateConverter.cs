@@ -1597,27 +1597,35 @@ namespace GitHub.Actions.WorkflowParser.Conversion
                 var id = default(string);
                 if (step is ActionStep action)
                 {
-                    if (action.Uses!.Value.StartsWith(WorkflowTemplateConstants.DockerUriPrefix, StringComparison.Ordinal))
+                    // When uses contains an expression, we can't determine the ID at parse time
+                    if (action.Uses is ExpressionToken)
                     {
-                        id = action.Uses!.Value.Substring(WorkflowTemplateConstants.DockerUriPrefix.Length);
+                        id = "uses-expression";
                     }
-                    else if (action.Uses!.Value.StartsWith("./") || action.Uses!.Value.StartsWith(".\\"))
+                    else if (action.Uses is StringToken usesToken)
                     {
-                        id = WorkflowConstants.SelfAlias;
-                    }
-                    else
-                    {
-                        var usesSegments = action.Uses!.Value.Split('@');
-                        var pathSegments = usesSegments[0].Split(new[] { '/', '\\' }, StringSplitOptions.RemoveEmptyEntries);
-                        var gitRef = usesSegments.Length == 2 ? usesSegments[1] : String.Empty;
-
-                        if (usesSegments.Length == 2 &&
-                            pathSegments.Length >= 2 &&
-                            !string.IsNullOrEmpty(pathSegments[0]) &&
-                            !string.IsNullOrEmpty(pathSegments[1]) &&
-                            !string.IsNullOrEmpty(gitRef))
+                        if (usesToken.Value.StartsWith(WorkflowTemplateConstants.DockerUriPrefix, StringComparison.Ordinal))
                         {
-                            id = $"{pathSegments[0]}/{pathSegments[1]}";
+                            id = usesToken.Value.Substring(WorkflowTemplateConstants.DockerUriPrefix.Length);
+                        }
+                        else if (usesToken.Value.StartsWith("./") || usesToken.Value.StartsWith(".\\"))
+                        {
+                            id = WorkflowConstants.SelfAlias;
+                        }
+                        else
+                        {
+                            var usesSegments = usesToken.Value.Split('@');
+                            var pathSegments = usesSegments[0].Split(new[] { '/', '\\' }, StringSplitOptions.RemoveEmptyEntries);
+                            var gitRef = usesSegments.Length == 2 ? usesSegments[1] : String.Empty;
+
+                            if (usesSegments.Length == 2 &&
+                                pathSegments.Length >= 2 &&
+                                !string.IsNullOrEmpty(pathSegments[0]) &&
+                                !string.IsNullOrEmpty(pathSegments[1]) &&
+                                !string.IsNullOrEmpty(gitRef))
+                            {
+                                id = $"{pathSegments[0]}/{pathSegments[1]}";
+                            }
                         }
                     }
                 }
@@ -1650,7 +1658,7 @@ namespace GitHub.Actions.WorkflowParser.Conversion
             var name = default(ScalarToken);
             var run = default(ScalarToken);
             var timeoutMinutes = default(ScalarToken);
-            var uses = default(StringToken);
+            var uses = default(TemplateToken);
             var with = default(TemplateToken);
             var workingDir = default(ScalarToken);
             var shell = default(ScalarToken);
@@ -1702,7 +1710,14 @@ namespace GitHub.Actions.WorkflowParser.Conversion
                         break;
 
                     case WorkflowTemplateConstants.Uses:
-                        uses = stepProperty.Value.AssertString($"{WorkflowTemplateConstants.Steps} item {WorkflowTemplateConstants.Uses}");
+                        if (stepProperty.Value is ExpressionToken)
+                        {
+                            uses = stepProperty.Value;
+                        }
+                        else
+                        {
+                            uses = stepProperty.Value.AssertString($"{WorkflowTemplateConstants.Steps} item {WorkflowTemplateConstants.Uses}");
+                        }
                         break;
 
                     case WorkflowTemplateConstants.With:
@@ -1740,7 +1755,6 @@ namespace GitHub.Actions.WorkflowParser.Conversion
             }
             else
             {
-                uses.AssertString($"{WorkflowTemplateConstants.Steps} item {WorkflowTemplateConstants.Uses}");
                 var result = new ActionStep
                 {
                     Id = id?.Value,
@@ -1753,11 +1767,19 @@ namespace GitHub.Actions.WorkflowParser.Conversion
                     With = with,
                 };
 
-                if (!uses.Value.StartsWith(WorkflowTemplateConstants.DockerUriPrefix, StringComparison.Ordinal) &&
-                    !uses.Value.StartsWith("./") &&
-                    !uses.Value.StartsWith(".\\"))
+                // Skip validation when uses contains an expression (will be evaluated at runtime)
+                if (uses is ExpressionToken)
                 {
-                    var usesSegments = uses.Value.Split('@');
+                    return result;
+                }
+
+                var usesString = uses.AssertString($"{WorkflowTemplateConstants.Steps} item {WorkflowTemplateConstants.Uses}");
+
+                if (!usesString.Value.StartsWith(WorkflowTemplateConstants.DockerUriPrefix, StringComparison.Ordinal) &&
+                    !usesString.Value.StartsWith("./") &&
+                    !usesString.Value.StartsWith(".\\"))
+                {
+                    var usesSegments = usesString.Value.Split('@');
                     var pathSegments = usesSegments[0].Split(new[] { '/', '\\' }, StringSplitOptions.RemoveEmptyEntries);
                     var gitRef = usesSegments.Length == 2 ? usesSegments[1] : String.Empty;
 
@@ -1767,7 +1789,7 @@ namespace GitHub.Actions.WorkflowParser.Conversion
                         String.IsNullOrEmpty(pathSegments[1]) ||
                         String.IsNullOrEmpty(gitRef))
                     {
-                        context.Error(uses, $"Expected format {{org}}/{{repo}}[/path]@ref. Actual '{uses.Value}'");
+                        context.Error(usesString, $"Expected format {{org}}/{{repo}}[/path]@ref. Actual '{usesString.Value}'");
                     }
                 }
 

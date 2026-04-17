@@ -1,4 +1,4 @@
-#nullable enable
+﻿#nullable enable
 
 using System.Runtime.Serialization;
 using GitHub.Actions.WorkflowParser.ObjectTemplating.Tokens;
@@ -54,7 +54,7 @@ namespace GitHub.Actions.WorkflowParser
         }
 
         [DataMember(Order = 6, Name = "uses", EmitDefaultValue = false)]
-        public StringToken? Uses
+        public TemplateToken? Uses
         {
             get;
             set;
@@ -77,7 +77,7 @@ namespace GitHub.Actions.WorkflowParser
                 If = If?.Clone(omitSource) as BasicExpressionToken,
                 Name = Name?.Clone(omitSource) as ScalarToken,
                 TimeoutMinutes = TimeoutMinutes?.Clone(omitSource) as ScalarToken,
-                Uses = Uses?.Clone(omitSource) as StringToken,
+                Uses = Uses?.Clone(omitSource),
                 With = With?.Clone(omitSource),
             };
         }

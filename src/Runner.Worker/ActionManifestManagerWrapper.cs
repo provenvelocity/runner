@@ -191,7 +191,8 @@ namespace GitHub.Runner.Worker
                     actionStep.ContinueOnError = ConvertToLegacyToken<TemplateToken>(usesStep.ContinueOnError);
                     actionStep.TimeoutInMinutes = ConvertToLegacyToken<TemplateToken>(usesStep.TimeoutMinutes);
                     actionStep.Environment = ConvertToLegacyToken<TemplateToken>(usesStep.Env);
-                    actionStep.Reference = ParseActionReference(usesStep.Uses?.Value);
+                    var usesValue = (usesStep.Uses as GitHub.Actions.WorkflowParser.ObjectTemplating.Tokens.StringToken)?.Value;
+                    actionStep.Reference = ParseActionReference(usesValue);
                     actionStep.Inputs = ConvertToLegacyToken<MappingToken>(usesStep.With);
                 }
 

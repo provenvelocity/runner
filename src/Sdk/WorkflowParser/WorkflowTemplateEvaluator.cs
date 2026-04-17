@@ -1,4 +1,4 @@
-#nullable disable // Consider removing in the future to minimize likelihood of NullReferenceException; refer https://learn.microsoft.com/en-us/dotnet/csharp/nullable-references
+﻿#nullable disable // Consider removing in the future to minimize likelihood of NullReferenceException; refer https://learn.microsoft.com/en-us/dotnet/csharp/nullable-references
 
 using System;
 using System.Collections.Generic;
@@ -424,6 +424,34 @@ namespace GitHub.Actions.WorkflowParser
             }
 
             return result ?? throw new InvalidOperationException("Job target cannot be null");
+        }
+
+        public String EvaluateUses(
+            TemplateToken token,
+            DictionaryExpressionData expressionData,
+            IList<IFunctionInfo> expressionFunctions)
+        {
+            var result = default(String);
+            var errorPrefix = $"Error when evaluating '{WorkflowTemplateConstants.StepUses}'.";
+
+            if (token != null && token.Type != TokenType.Null)
+            {
+                var context = CreateContext(expressionData, expressionFunctions);
+                try
+                {
+                    token = TemplateEvaluator.Evaluate(context, WorkflowTemplateConstants.StepUses, token, 0, null);
+                    context.Errors.Check(errorPrefix);
+                    result = token.AssertString(WorkflowTemplateConstants.StepUses).Value;
+                }
+                catch (Exception ex) when (!(ex is TemplateValidationException))
+                {
+                    context.Errors.Add(ex);
+                }
+
+                context.Errors.Check(errorPrefix);
+            }
+
+            return result;
         }
 
         public Snapshot EvaluateSnapshot(
@@ -937,7 +965,7 @@ namespace GitHub.Actions.WorkflowParser
 
             // Add vars context even if addMissingContexts is false to avoid
             // JobEnvironment Evaluation errors
-            if(!result.ExpressionValues.ContainsKey(WorkflowTemplateConstants.Vars))
+            if (!result.ExpressionValues.ContainsKey(WorkflowTemplateConstants.Vars))
             {
                 result.ExpressionValues[WorkflowTemplateConstants.Vars] = null;
             }
