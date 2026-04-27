@@ -308,7 +308,7 @@
           "continue-on-error": "boolean-steps-context",
           "timeout-minutes": "number-steps-context",
           "uses": {
-            "type": "non-empty-string",
+            "type": "step-uses",
             "required": true
           },
           "with": "step-with",
@@ -361,6 +361,18 @@
         "sequence",
         "mapping"
       ]
+    },
+
+    "step-uses": {
+      "context": [
+        "github",
+        "inputs",
+        "vars",
+        "needs",
+        "strategy",
+        "matrix"
+      ],
+      "string": {}
     },
 
     "step-env": {

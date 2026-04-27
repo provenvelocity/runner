@@ -67,6 +67,7 @@ namespace GitHub.DistributedTask.Pipelines.ObjectTemplating
         public const String Snapshot = "snapshot";
         public const String StepEnv = "step-env";
         public const String StepIfResult = "step-if-result";
+        public const String StepUses = "step-uses";
         public const String StepWith = "step-with";
         public const String Steps = "steps";
         public const String Strategy = "strategy";

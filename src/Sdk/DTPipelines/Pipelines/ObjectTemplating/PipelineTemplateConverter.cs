@@ -443,7 +443,7 @@ namespace GitHub.DistributedTask.Pipelines.ObjectTemplating
             var name = default(ScalarToken);
             var run = default(ScalarToken);
             var timeoutMinutes = default(ScalarToken);
-            var uses = default(StringToken);
+            var uses = default(TemplateToken);
             var with = default(TemplateToken);
             var workingDir = default(ScalarToken);
             var path = default(ScalarToken);
@@ -522,7 +522,14 @@ namespace GitHub.DistributedTask.Pipelines.ObjectTemplating
                         break;
 
                     case PipelineTemplateConstants.Uses:
-                        uses = stepProperty.Value.AssertString($"{PipelineTemplateConstants.Steps} item {PipelineTemplateConstants.Uses}");
+                        if (stepProperty.Value is ExpressionToken)
+                        {
+                            uses = stepProperty.Value;
+                        }
+                        else
+                        {
+                            uses = stepProperty.Value.AssertString($"{PipelineTemplateConstants.Steps} item {PipelineTemplateConstants.Uses}");
+                        }
                         break;
 
                     case PipelineTemplateConstants.With:
@@ -575,7 +582,15 @@ namespace GitHub.DistributedTask.Pipelines.ObjectTemplating
             }
             else
             {
-                uses.AssertString($"{PipelineTemplateConstants.Steps} item {PipelineTemplateConstants.Uses}");
+                // Evaluate expression token inline if the template context has expression values
+                if (uses is ExpressionToken usesExpr)
+                {
+                    var evaluated = TemplateEvaluator.Evaluate(context, PipelineTemplateConstants.StepUses, usesExpr, 0, null, omitHeader: true);
+                    context.Errors.Check();
+                    uses = evaluated;
+                }
+
+                var usesString = uses?.AssertString($"{PipelineTemplateConstants.Steps} item {PipelineTemplateConstants.Uses}");
                 var result = new ActionStep
                 {
                     ContextName = id?.Value,
@@ -587,22 +602,22 @@ namespace GitHub.DistributedTask.Pipelines.ObjectTemplating
                     Environment = env,
                 };
 
-                if (uses.Value.StartsWith("docker://", StringComparison.Ordinal))
+                if (usesString.Value.StartsWith("docker://", StringComparison.Ordinal))
                 {
-                    var image = uses.Value.Substring("docker://".Length);
+                    var image = usesString.Value.Substring("docker://".Length);
                     result.Reference = new ContainerRegistryReference { Image = image };
                 }
-                else if (uses.Value.StartsWith("./") || uses.Value.StartsWith(".\\"))
+                else if (usesString.Value.StartsWith("./") || usesString.Value.StartsWith(".\\"))
                 {
                     result.Reference = new RepositoryPathReference
                     {
                         RepositoryType = PipelineConstants.SelfAlias,
-                        Path = uses.Value
+                        Path = usesString.Value
                     };
                 }
                 else
                 {
-                    var usesSegments = uses.Value.Split('@');
+                    var usesSegments = usesString.Value.Split('@');
                     var pathSegments = usesSegments[0].Split(new[] { '/', '\\' }, StringSplitOptions.RemoveEmptyEntries);
                     var gitRef = usesSegments.Length == 2 ? usesSegments[1] : String.Empty;
 
@@ -613,7 +628,7 @@ namespace GitHub.DistributedTask.Pipelines.ObjectTemplating
                         String.IsNullOrEmpty(gitRef))
                     {
                         // todo: loc
-                        context.Error(uses, $"Expected format {{org}}/{{repo}}[/path]@ref. Actual '{uses.Value}'");
+                        context.Error(usesString, $"Expected format {{org}}/{{repo}}[/path]@ref. Actual '{usesString.Value}'");
                     }
                     else
                     {

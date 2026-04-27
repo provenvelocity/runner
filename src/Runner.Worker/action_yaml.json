@@ -145,7 +145,7 @@
                     "id": "non-empty-string",
                     "if": "step-if",
                     "uses": {
-                        "type": "non-empty-string",
+                        "type": "step-uses",
                         "required": true
                     },
                     "continue-on-error": "boolean-steps-context",
@@ -185,6 +185,19 @@
             "string": {}
         },
         "non-empty-string": {
+            "string": {
+                "require-non-empty": true
+            }
+        },
+        "step-uses": {
+            "context": [
+                "github",
+                "inputs",
+                "vars",
+                "needs",
+                "strategy",
+                "matrix"
+            ],
             "string": {
                 "require-non-empty": true
             }

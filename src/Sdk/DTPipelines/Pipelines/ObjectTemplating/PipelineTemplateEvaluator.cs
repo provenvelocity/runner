@@ -107,6 +107,33 @@ namespace GitHub.DistributedTask.Pipelines.ObjectTemplating
             return result;
         }
 
+        public String EvaluateStepUses(
+            TemplateToken token,
+            DictionaryContextData contextData,
+            IList<IFunctionInfo> expressionFunctions)
+        {
+            var result = default(String);
+
+            if (token != null && token.Type != TokenType.Null)
+            {
+                var context = CreateContext(contextData, expressionFunctions);
+                try
+                {
+                    token = TemplateEvaluator.Evaluate(context, PipelineTemplateConstants.StepUses, token, 0, null, omitHeader: true);
+                    context.Errors.Check();
+                    result = token.AssertString($"step {PipelineTemplateConstants.Uses}").Value;
+                }
+                catch (Exception ex) when (!(ex is TemplateValidationException))
+                {
+                    context.Errors.Add(ex);
+                }
+
+                context.Errors.Check();
+            }
+
+            return result;
+        }
+
         public Dictionary<String, String> EvaluateStepEnvironment(
             TemplateToken token,
             DictionaryContextData contextData,

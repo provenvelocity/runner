@@ -1,4 +1,4 @@
-using System;
+﻿using System;
 using System.Collections.Generic;
 using GitHub.DistributedTask.Expressions2;
 using GitHub.DistributedTask.ObjectTemplating.Tokens;
@@ -17,6 +17,11 @@ namespace GitHub.DistributedTask.Pipelines.ObjectTemplating
             IList<IFunctionInfo> expressionFunctions);
 
         String EvaluateStepDisplayName(
+            TemplateToken token,
+            DictionaryContextData contextData,
+            IList<IFunctionInfo> expressionFunctions);
+
+        String EvaluateStepUses(
             TemplateToken token,
             DictionaryContextData contextData,
             IList<IFunctionInfo> expressionFunctions);

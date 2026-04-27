@@ -44,7 +44,7 @@ namespace GitHub.Runner.Worker
                 executionContext,
                 "Load",
                 () => _legacyManager.Load(executionContext, manifestFile),
-                () => ConvertToLegacyActionDefinitionData(_newManager.Load(executionContext, manifestFile)),
+                () => ConvertToLegacyActionDefinitionData(executionContext, _newManager.Load(executionContext, manifestFile)),
                 (legacyResult, newResult) => CompareActionDefinition(legacyResult, newResult));
         }
 
@@ -105,7 +105,7 @@ namespace GitHub.Runner.Worker
         }
 
         // Conversion helper methods
-        private ActionDefinitionData ConvertToLegacyActionDefinitionData(ActionDefinitionDataNew newData)
+        private ActionDefinitionData ConvertToLegacyActionDefinitionData(IExecutionContext executionContext, ActionDefinitionDataNew newData)
         {
             if (newData == null)
             {
@@ -118,11 +118,11 @@ namespace GitHub.Runner.Worker
                 Description = newData.Description,
                 Inputs = ConvertToLegacyToken<MappingToken>(newData.Inputs),
                 Deprecated = newData.Deprecated,
-                Execution = ConvertToLegacyExecution(newData.Execution)
+                Execution = ConvertToLegacyExecution(executionContext, newData.Execution)
             };
         }
 
-        private ActionExecutionData ConvertToLegacyExecution(ActionExecutionData execution)
+        private ActionExecutionData ConvertToLegacyExecution(IExecutionContext executionContext, ActionExecutionData execution)
         {
             if (execution == null)
             {
@@ -148,7 +148,7 @@ namespace GitHub.Runner.Worker
             {
                 return new CompositeActionExecutionData
                 {
-                    Steps = ConvertToLegacySteps(compositeNew.Steps),
+                    Steps = ConvertToLegacySteps(executionContext, compositeNew.Steps),
                     Outputs = ConvertToLegacyToken<MappingToken>(compositeNew.Outputs)
                 };
             }
@@ -159,7 +159,7 @@ namespace GitHub.Runner.Worker
             }
         }
 
-        private List<GitHub.DistributedTask.Pipelines.ActionStep> ConvertToLegacySteps(List<GitHub.Actions.WorkflowParser.IStep> newSteps)
+        private List<GitHub.DistributedTask.Pipelines.ActionStep> ConvertToLegacySteps(IExecutionContext executionContext, List<GitHub.Actions.WorkflowParser.IStep> newSteps)
         {
             if (newSteps == null)
             {
@@ -191,7 +191,18 @@ namespace GitHub.Runner.Worker
                     actionStep.ContinueOnError = ConvertToLegacyToken<TemplateToken>(usesStep.ContinueOnError);
                     actionStep.TimeoutInMinutes = ConvertToLegacyToken<TemplateToken>(usesStep.TimeoutMinutes);
                     actionStep.Environment = ConvertToLegacyToken<TemplateToken>(usesStep.Env);
-                    var usesValue = (usesStep.Uses as GitHub.Actions.WorkflowParser.ObjectTemplating.Tokens.StringToken)?.Value;
+                    string usesValue;
+                    if (usesStep.Uses is GitHub.Actions.WorkflowParser.ObjectTemplating.Tokens.ExpressionToken
+                        && executionContext.Global.Variables.GetBoolean(Constants.Runner.Features.EvaluateUsesExpressions) == true)
+                    {
+                        var templateEvaluator = executionContext.ToPipelineTemplateEvaluator();
+                        var usesToken = ConvertToLegacyToken<TemplateToken>(usesStep.Uses);
+                        usesValue = templateEvaluator.EvaluateStepUses(usesToken, executionContext.ExpressionValues, executionContext.ExpressionFunctions);
+                    }
+                    else
+                    {
+                        usesValue = (usesStep.Uses as GitHub.Actions.WorkflowParser.ObjectTemplating.Tokens.StringToken)?.Value;
+                    }
                     actionStep.Reference = ParseActionReference(usesValue);
                     actionStep.Inputs = ConvertToLegacyToken<MappingToken>(usesStep.With);
                 }

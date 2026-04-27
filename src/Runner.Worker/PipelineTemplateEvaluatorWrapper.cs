@@ -79,6 +79,18 @@ namespace GitHub.Runner.Worker
                 (legacyResult, newResult) => string.Equals(legacyResult, newResult, StringComparison.Ordinal));
         }
 
+        public string EvaluateStepUses(
+            TemplateToken token,
+            DictionaryContextData contextData,
+            IList<IFunctionInfo> expressionFunctions)
+        {
+            return EvaluateAndCompare(
+                "EvaluateStepUses",
+                () => _legacyEvaluator.EvaluateStepUses(token, contextData, expressionFunctions),
+                () => _newEvaluator.EvaluateUses(ConvertToken(token), ConvertData(contextData), ConvertFunctions(expressionFunctions)),
+                (legacyResult, newResult) => string.Equals(legacyResult, newResult, StringComparison.Ordinal));
+        }
+
         public Dictionary<string, string> EvaluateStepEnvironment(
             TemplateToken token,
             DictionaryContextData contextData,
