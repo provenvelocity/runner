@@ -1,0 +1,39 @@
+name: Sync upstream main
+
+on:
+  schedule:
+    # Runs every day at 06:00 UTC
+    - cron: '0 6 * * *'
+  workflow_dispatch: # allow manual trigger from the Actions tab
+
+jobs:
+  sync:
+    name: Merge actions/runner main → feature/evaluate-uses-expressions
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+
+    steps:
+      - name: Checkout feature branch
+        uses: actions/checkout@v4
+        with:
+          ref: feature/evaluate-uses-expressions
+          # Use a PAT if you need to push back; GITHUB_TOKEN works for same-repo pushes
+          token: ${{ secrets.GITHUB_TOKEN }}
+          fetch-depth: 0
+
+      - name: Add upstream remote
+        run: git remote add upstream https://github.com/actions/runner.git
+
+      - name: Fetch upstream main and tags
+        run: git fetch upstream main --tags
+
+      - name: Merge upstream main
+        run: |
+          git config user.name  "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git merge upstream/main --no-edit --strategy-option=theirs \
+            -m "chore: sync upstream actions/runner main [skip ci]"
+
+      - name: Push updated branch and tags
+        run: git push origin feature/evaluate-uses-expressions --tags
