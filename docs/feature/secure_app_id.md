@@ -163,8 +163,9 @@ narrowly-scoped, already-minted tokens do (same trust tier as `GITHUB_TOKEN` tod
 `Runner.Worker`) instead of one.
 
 This document details the config format and token-minting flow once (they're identical between
-options), then describes where each option places that logic. **No decision has been made yet —
-both options are presented here for review.**
+options), then describes where each option places that logic. **Option A has been implemented**
+(`src/Runner.Worker/CrossHostAppTokenProvider.cs`, commit `60b17d82`); Option B remains documented
+here as a future hardening step, not implemented.
 
 ## Config format and token-minting flow (shared by both options)
 
@@ -233,13 +234,105 @@ for the remainder of that job (the Worker process is per-job, so no cross-job ca
   back to anonymous for a host that *is* allow-listed (that would mask a misconfiguration).
 - Any minted token is added to the secret masker before use.
 
-### Code locations (Option A)
+### Code locations (Option A — implemented)
 
-- New allow-list loader + token-minting component in `Runner.Worker` (e.g.
-  `CrossHostAppTokenProvider`), initialized once during `ActionManager` (or `Worker.cs`) startup.
-- `ActionManager.BuildCustomUrlDownloadInfo` (`src/Runner.Worker/ActionManager.cs`) changes from
-  unconditionally reusing `defaultAccessToken` to: look up the action's host in the allow-list;
-  if present, use the minted installation token; if absent, no token.
+- `src/Runner.Worker/CrossHostAppTokenProvider.cs` — the allow-list loader + JWT/token-minting
+  component (`ICrossHostAppTokenProvider`, resolved via `HostContext.GetService<T>()`, lazily
+  loads the allow-list on first use).
+- `ActionManager.BuildCustomUrlDownloadInfoAsync` (`src/Runner.Worker/ActionManager.cs`) — looks up
+  the action's host via the provider; uses the minted token if the host is allow-listed, otherwise
+  `Authentication` is left null (anonymous).
+- `src/Test/L0/Worker/CrossHostAppTokenProviderL0.cs` — unit tests (unlisted host, missing key
+  file, explicit `installationId`, dynamic installation lookup, no-installation-found error, token
+  caching).
+
+## How to set this up (Option A)
+
+### 1. Create a GitHub App on the target host
+
+On the host you want to allow cross-host `uses:` downloads from (e.g. `github.kp.org`):
+
+1. Create a GitHub App (org or enterprise settings → Developer settings → GitHub Apps).
+2. Grant it repository permission **Contents: Read-only** (that's all `tarball`/`zipball` download
+   needs). Add more only if your actions also need it.
+3. Install the App on the org(s)/repo(s) that hold the actions you want to reference.
+4. Note the **App ID** (shown on the App's settings page).
+5. Generate a private key for the App ("Generate a private key" button) — this downloads a `.pem`
+   file once; there's no way to re-download it later, only regenerate a new one.
+6. Optional: note the **Installation ID** from the URL of the installed-app settings page
+   (`.../settings/installations/<id>`) if you want to pin it in config instead of relying on
+   dynamic lookup by owner.
+
+### 2. Place the private key on the runner
+
+Copy the downloaded `.pem` file onto the runner host/image at a path the runner service account
+can read and nothing else can — mirror this repo's own convention for its RSA registration key:
+
+```bash
+sudo mkdir -p /etc/actions-runner/keys
+sudo cp github-kp-org-app.pem /etc/actions-runner/keys/github-kp-org-app.pem
+sudo chown <runner-service-user> /etc/actions-runner/keys/github-kp-org-app.pem
+sudo chmod 600 /etc/actions-runner/keys/github-kp-org-app.pem
+```
+
+For a container/ARC deployment, mount this from a Kubernetes Secret instead of baking it into the
+image.
+
+### 3. Write the allow-list config
+
+Create the config directory (default `<runner_root>/.cross_host_apps/`, or point
+`ACTIONS_RUNNER_CROSS_HOST_APPS_DIR` at a directory of your choice) and add a `*.json` file:
+
+```bash
+mkdir -p /actions-runner/.cross_host_apps
+cat > /actions-runner/.cross_host_apps/github-kp-org.json <<'EOF'
+{
+  "hosts": [
+    {
+      "host": "github.kp.org",
+      "appId": "123456",
+      "privateKeyPath": "/etc/actions-runner/keys/github-kp-org-app.pem",
+      "installationId": "789012"
+    }
+  ]
+}
+EOF
+```
+
+Omit `installationId` if you'd rather it be resolved dynamically per-owner at mint time (useful if
+the App is installed across many orgs on that host). No runner restart is required beyond the next
+job — the allow-list is loaded once per `Runner.Worker` process (i.e., once per job).
+
+### 4. Reference it from a workflow
+
+No special syntax beyond the custom-URL `uses:` form already documented in
+[fork-0001-custom-uses-url.md](../adrs/fork-0001-custom-uses-url.md):
+
+```yaml
+steps:
+  - uses: https://github.kp.org/some-org/some-action@v1
+```
+
+If `github.kp.org` is allow-listed, the download is authenticated with a freshly minted GitHub App
+installation token. If it isn't, the download is anonymous (works for public repos, fails for
+private ones with a normal 404/403 from the download itself — not a runner-level error).
+
+### 5. Troubleshooting
+
+All of these come from `CrossHostAppTokenProvider` and are visible in the job's `resolve_actions`/
+`download_action` step output:
+
+| Message | Cause | Fix |
+| --- | --- | --- |
+| `Cross-host app entry for host '<host>' is misconfigured: '<file>' is missing required field(s) appId/privateKeyPath.` | The JSON entry is missing `appId` or `privateKeyPath`. | Fix the JSON file for that host. |
+| `Cross-host app entry for host '<host>' is misconfigured: private key file '<path>' not found.` | `privateKeyPath` doesn't point to a real, readable file. | Check the path and file permissions. |
+| `Unable to read GitHub App private key file '<path>': ...` | File exists but couldn't be read (permissions, disk error). | Check ownership/permissions match the runner service account. |
+| `Private key file '<path>' is not a valid PEM-encoded RSA private key.` | Wrong file, or corrupted/re-encoded key. | Re-download the key from the App's settings page. |
+| `No GitHub App installation found for owner '<owner>' on host '<host>'.` | `installationId` omitted and the App isn't installed on that owner's account. | Install the App on that org/user, or set `installationId` explicitly. |
+| `Failed to list GitHub App installations on host '<host>' (HTTP ..., request id: ...)` / `Failed to mint a GitHub App installation token ...` | Network/API error talking to the host, or App ID is wrong. | Check connectivity to the host's API, and that `appId` matches the App exactly. |
+
+A host that's simply **not mentioned** in any allow-list file is not an error — it's the normal
+case for public actions and results in a plain anonymous download.
 
 ### Code locations (Option B)
 
