@@ -3403,6 +3403,10 @@ runs:
             _hc.SetSingleton<IActionManifestManagerWrapper>(actionManifestWrapper);
             _hc.SetSingleton<IHttpClientHandlerFactory>(new HttpClientHandlerFactory());
 
+            var crossHostAppTokenProvider = new CrossHostAppTokenProvider();
+            crossHostAppTokenProvider.Initialize(_hc);
+            _hc.SetSingleton<ICrossHostAppTokenProvider>(crossHostAppTokenProvider);
+
             _configurationStore = new Mock<IConfigurationStore>();
             _configurationStore
                 .Setup(x => x.GetSettings())

@@ -1040,7 +1040,7 @@ namespace GitHub.Runner.Worker
 
                 if (!string.IsNullOrEmpty(repositoryReference.Url))
                 {
-                    result[group.Key] = BuildCustomUrlDownloadInfo(repositoryReference, defaultAccessToken);
+                    result[group.Key] = await BuildCustomUrlDownloadInfoAsync(executionContext, repositoryReference);
                 }
                 else
                 {
@@ -1645,16 +1645,21 @@ namespace GitHub.Runner.Worker
         /// <summary>
         /// Builds action download info directly from a uses: URL, bypassing the server-side resolve
         /// call entirely. Uses the same github.com vs GHES host convention as the rest of the runner
-        /// (UrlUtil.IsHostedServer) to determine the REST API host, and falls back to the job's own
-        /// GITHUB_TOKEN for authentication since there's no per-action token issuance for hosts outside
-        /// the runner's configured server.
+        /// (UrlUtil.IsHostedServer) to determine the REST API host. Auth is default-deny: only hosts
+        /// on the cross-host app allow-list (see ICrossHostAppTokenProvider) get a token attached, via
+        /// a GitHub App installation token scoped to that host. Every other custom host gets an
+        /// anonymous request — the job's own GITHUB_TOKEN is never forwarded to a different host.
         /// </summary>
-        private static WebApi.ActionDownloadInfo BuildCustomUrlDownloadInfo(Pipelines.RepositoryPathReference repositoryReference, string defaultAccessToken)
+        private async Task<WebApi.ActionDownloadInfo> BuildCustomUrlDownloadInfoAsync(IExecutionContext executionContext, Pipelines.RepositoryPathReference repositoryReference)
         {
             var uriBuilder = new UriBuilder(repositoryReference.Url);
             var apiBase = UrlUtil.IsHostedServer(uriBuilder)
                 ? $"{uriBuilder.Scheme}://api.{uriBuilder.Host}"
                 : $"{repositoryReference.Url}/api/v3";
+
+            var owner = repositoryReference.Name.Split('/', 2)[0];
+            var tokenProvider = HostContext.GetService<ICrossHostAppTokenProvider>();
+            var crossHostToken = await tokenProvider.TryGetTokenAsync(executionContext, uriBuilder.Host, owner);
 
             return new WebApi.ActionDownloadInfo
             {
@@ -1666,7 +1671,7 @@ namespace GitHub.Runner.Worker
                 ResolvedSha = repositoryReference.Ref,
                 TarballUrl = $"{apiBase}/repos/{repositoryReference.Name}/tarball/{repositoryReference.Ref}",
                 ZipballUrl = $"{apiBase}/repos/{repositoryReference.Name}/zipball/{repositoryReference.Ref}",
-                Authentication = new WebApi.ActionDownloadAuthentication { Token = defaultAccessToken },
+                Authentication = string.IsNullOrEmpty(crossHostToken) ? null : new WebApi.ActionDownloadAuthentication { Token = crossHostToken },
                 SourceUrl = repositoryReference.Url,
             };
         }
