@@ -44,10 +44,10 @@ namespace GitHub.Runner.Common.Tests.Worker
             _hc?.Dispose();
         }
 
-        private static string WritePrivateKey(string dir)
+        private static string WritePrivateKey(string dir, string fileName = "app.pem")
         {
             using var rsa = RSA.Create(2048);
-            var keyPath = Path.Combine(dir, "app.pem");
+            var keyPath = Path.Combine(dir, fileName);
             File.WriteAllText(keyPath, rsa.ExportRSAPrivateKeyPem());
             return keyPath;
         }
@@ -241,5 +241,140 @@ namespace GitHub.Runner.Common.Tests.Worker
                 Teardown();
             }
         }
+
+        [Fact]
+        [Trait("Level", "L0")]
+        [Trait("Category", "Worker")]
+        public async void TryGetTokenAsync_PerOrgOverride_UsesOwnerSpecificAppInsteadOfHostDefault()
+        {
+            try
+            {
+                Setup();
+                var defaultKeyPath = WritePrivateKey(_configDir, "default.pem");
+                var teamAKeyPath = WritePrivateKey(_configDir, "team-a.pem");
+                WriteAllowList("hosts.json", $@"{{
+                    ""hosts"": [
+                        {{
+                            ""host"": ""github.kp.org"",
+                            ""appId"": ""111"",
+                            ""privateKeyPath"": ""{defaultKeyPath.Replace("\\", "\\\\")}"",
+                            ""installationId"": ""999"",
+                            ""orgs"": [
+                                {{ ""owner"": ""team-a"", ""appId"": ""222"", ""privateKeyPath"": ""{teamAKeyPath.Replace("\\", "\\\\")}"", ""installationId"": ""333"" }}
+                            ]
+                        }}
+                    ]
+                }}");
+
+                var mockClientHandler = new Mock<HttpClientHandler>();
+                mockClientHandler.Protected()
+                    .Setup<Task<HttpResponseMessage>>("SendAsync",
+                        ItExpr.Is<HttpRequestMessage>(m => m.RequestUri == new Uri("https://github.kp.org/api/v3/app/installations/333/access_tokens")),
+                        ItExpr.IsAny<CancellationToken>())
+                    .ReturnsAsync(() => new HttpResponseMessage(HttpStatusCode.Created)
+                    {
+                        Content = new StringContent($"{{\"token\":\"team_a_token\",\"expires_at\":\"{DateTime.UtcNow.AddHours(1):O}\"}}")
+                    });
+                mockClientHandler.Protected()
+                    .Setup<Task<HttpResponseMessage>>("SendAsync",
+                        ItExpr.Is<HttpRequestMessage>(m => m.RequestUri == new Uri("https://github.kp.org/api/v3/app/installations/999/access_tokens")),
+                        ItExpr.IsAny<CancellationToken>())
+                    .ReturnsAsync(() => new HttpResponseMessage(HttpStatusCode.Created)
+                    {
+                        Content = new StringContent($"{{\"token\":\"host_default_token\",\"expires_at\":\"{DateTime.UtcNow.AddHours(1):O}\"}}")
+                    });
+
+                var provider = CreateProvider(mockClientHandler);
+
+                var teamAToken = await provider.TryGetTokenAsync(_ec.Object, "github.kp.org", "team-a");
+                var otherOwnerToken = await provider.TryGetTokenAsync(_ec.Object, "github.kp.org", "some-other-owner");
+
+                Assert.Equal("team_a_token", teamAToken);
+                Assert.Equal("host_default_token", otherOwnerToken);
+            }
+            finally
+            {
+                Teardown();
+            }
+        }
+
+        [Fact]
+        [Trait("Level", "L0")]
+        [Trait("Category", "Worker")]
+        public async void TryGetTokenAsync_OrgsOnlyNoHostDefault_UnlistedOwnerIsAnonymous()
+        {
+            try
+            {
+                Setup();
+                var teamAKeyPath = WritePrivateKey(_configDir, "team-a.pem");
+                WriteAllowList("hosts.json", $@"{{
+                    ""hosts"": [
+                        {{
+                            ""host"": ""github.kp.org"",
+                            ""orgs"": [
+                                {{ ""owner"": ""team-a"", ""appId"": ""222"", ""privateKeyPath"": ""{teamAKeyPath.Replace("\\", "\\\\")}"", ""installationId"": ""333"" }}
+                            ]
+                        }}
+                    ]
+                }}");
+
+                var mockClientHandler = new Mock<HttpClientHandler>();
+                var provider = CreateProvider(mockClientHandler);
+
+                var token = await provider.TryGetTokenAsync(_ec.Object, "github.kp.org", "some-other-owner");
+
+                Assert.Null(token);
+                mockClientHandler.Protected().Verify("SendAsync", Times.Never(), ItExpr.IsAny<HttpRequestMessage>(), ItExpr.IsAny<CancellationToken>());
+            }
+            finally
+            {
+                Teardown();
+            }
+        }
+
+        [Fact]
+        [Trait("Level", "L0")]
+        [Trait("Category", "Worker")]
+        public async void TryGetTokenAsync_BrokenOrgOverride_ThrowsButOtherOrgsStillWork()
+        {
+            try
+            {
+                Setup();
+                var teamAKeyPath = WritePrivateKey(_configDir, "team-a.pem");
+                WriteAllowList("hosts.json", $@"{{
+                    ""hosts"": [
+                        {{
+                            ""host"": ""github.kp.org"",
+                            ""orgs"": [
+                                {{ ""owner"": ""team-a"", ""appId"": ""222"", ""privateKeyPath"": ""{teamAKeyPath.Replace("\\", "\\\\")}"", ""installationId"": ""333"" }},
+                                {{ ""owner"": ""team-broken"", ""appId"": ""444"", ""privateKeyPath"": ""/does/not/exist.pem"" }}
+                            ]
+                        }}
+                    ]
+                }}");
+
+                var mockClientHandler = new Mock<HttpClientHandler>();
+                mockClientHandler.Protected()
+                    .Setup<Task<HttpResponseMessage>>("SendAsync", ItExpr.IsAny<HttpRequestMessage>(), ItExpr.IsAny<CancellationToken>())
+                    .ReturnsAsync(() => new HttpResponseMessage(HttpStatusCode.Created)
+                    {
+                        Content = new StringContent($"{{\"token\":\"team_a_token\",\"expires_at\":\"{DateTime.UtcNow.AddHours(1):O}\"}}")
+                    });
+
+                var provider = CreateProvider(mockClientHandler);
+
+                var ex = await Assert.ThrowsAsync<InvalidOperationException>(
+                    () => provider.TryGetTokenAsync(_ec.Object, "github.kp.org", "team-broken"));
+                Assert.Contains("team-broken", ex.Message);
+
+                var teamAToken = await provider.TryGetTokenAsync(_ec.Object, "github.kp.org", "team-a");
+                Assert.Equal("team_a_token", teamAToken);
+            }
+            finally
+            {
+                Teardown();
+            }
+        }
     }
 }
+

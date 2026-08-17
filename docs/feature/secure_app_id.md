@@ -73,6 +73,44 @@ cat > /actions-runner/.cross_host_apps/github-kp-org.json <<'EOF'
 EOF
 ```
 
+If different orgs on the same host use different GitHub Apps, add an `orgs` list to that host
+entry — each owner gets its own `appId`/`privateKeyPath`/`installationId`, and the host-level
+fields (if present) become the default for any owner not explicitly listed:
+
+```json
+{
+  "hosts": [
+    {
+      "host": "github.kp.org",
+      "appId": "123456",
+      "privateKeyPath": "/etc/actions-runner/keys/default-app.pem",
+      "orgs": [
+        {
+          "owner": "team-a",
+          "appId": "222222",
+          "privateKeyPath": "/etc/actions-runner/keys/team-a-app.pem",
+          "installationId": "333333"
+        },
+        {
+          "owner": "team-b",
+          "appId": "444444",
+          "privateKeyPath": "/etc/actions-runner/keys/team-b-app.pem"
+        }
+      ]
+    }
+  ]
+}
+```
+
+- A `uses:` from `team-a` or `team-b` on `github.kp.org` uses that org's own App; any other owner
+  on the same host falls back to the host-level default App (if one is configured).
+- The host-level `appId`/`privateKeyPath` are optional if every owner you care about has its own
+  `orgs` entry — omit them and owners without an explicit entry get anonymous requests instead of
+  a default App.
+- A broken `orgs` entry (missing fields, bad key file) only breaks auth for *that* owner — it
+  throws a clear error naming the owner and host, but doesn't affect other owners or the host
+  default.
+
 Omit `installationId` if you'd rather it be resolved dynamically per-owner at mint time (useful if
 the App is installed across many orgs on that host). No runner restart is required beyond the next
 job — the allow-list is loaded once per `Runner.Worker` process (i.e., once per job).
@@ -223,7 +261,8 @@ lets different teams/hosts each own their own file without merge conflicts.
 
 - Directory location: `ACTIONS_RUNNER_CROSS_HOST_APPS_DIR` environment variable, defaulting to
   `<runner_root>/.cross_host_apps/` if unset.
-- Each file contains one or more host entries:
+- Each file contains one or more host entries; a host entry may set host-level fields (used as
+  the default App for that host), an `orgs` list (per-owner overrides), or both:
 
 ```json
 {
@@ -232,7 +271,10 @@ lets different teams/hosts each own their own file without merge conflicts.
       "host": "github.kp.org",
       "appId": "123456",
       "privateKeyPath": "/etc/actions-runner/keys/github-kp-org-app.pem",
-      "installationId": "789012"
+      "installationId": "789012",
+      "orgs": [
+        { "owner": "team-a", "appId": "222222", "privateKeyPath": "/etc/actions-runner/keys/team-a-app.pem" }
+      ]
     }
   ]
 }
@@ -242,12 +284,17 @@ lets different teams/hosts each own their own file without merge conflicts.
   file must be readable only by the runner service account — same file-permission convention this
   repo already uses for its own RSA registration key
   (`RSAFileKeyManager`: `chmod 600` on Linux/macOS; `RSAEncryptedFileKeyManager`: DPAPI on Windows).
-- `installationId` is optional. If omitted, it's resolved dynamically at mint time via
-  `GET {apiBase}/app/installations` (using the App's JWT), matching `account.login` against the
-  target repo's owner from the `uses:` reference.
-- **Host matching is exact, case-insensitive string equality** after `Uri` parsing — never
+- `installationId` is optional (at either host or org level). If omitted, it's resolved
+  dynamically at mint time via `GET {apiBase}/app/installations` (using the App's JWT), matching
+  `account.login` against the target repo's owner from the `uses:` reference.
+- **Resolution order per (host, owner)**: an `orgs` entry matching the owner wins if present;
+  otherwise the host-level default (if configured) applies; otherwise the request is anonymous.
+  A broken match (missing fields, bad key file) throws rather than falling through to the next
+  option — it fails loud specifically for the (host, owner) pair that matched it, not for
+  everything else on that host.
+- **Host and owner matching is exact, case-insensitive string equality** — never
   `EndsWith`/`Contains` — so e.g. `github.kp.org.evil.com` can never match an allow-list entry for
-  `github.kp.org`.
+  `github.kp.org`, and `team-a-fake` can never match an `orgs` entry for `team-a`.
 
 ### Token minting flow
 
@@ -272,11 +319,14 @@ for the remainder of that job (the Worker process is per-job, so no cross-job ca
 
 ### Fail-closed rules
 
-- Host not on the allow-list → no token attached (anonymous request), never the primary
-  `GITHUB_TOKEN`, never another host's credential.
-- No installation found for the target owner → fail the action download with a clear error
-  ("No GitHub App installation found for owner '{owner}' on host '{host}'"), don't silently fall
-  back to anonymous for a host that *is* allow-listed (that would mask a misconfiguration).
+- Host/owner combination not matched by any host-level default or `orgs` entry → no token
+  attached (anonymous request), never the primary `GITHUB_TOKEN`, never another host's credential.
+- A host-level default or `orgs` entry that IS matched but is broken (missing fields, bad key
+  file) → fail the action download with a clear error naming the host (and owner, for a broken
+  `orgs` entry), rather than silently falling back to anonymous or to a less-specific match — that
+  would mask a misconfiguration.
+- No installation found for the target owner (when `installationId` is resolved dynamically) →
+  same fail-loud treatment.
 - Any minted token is added to the secret masker before use.
 
 ### Code locations

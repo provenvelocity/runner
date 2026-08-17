@@ -16,9 +16,11 @@ using Newtonsoft.Json.Linq;
 
 namespace GitHub.Runner.Worker
 {
-    // Config schema for docs/feature/secure_app_id.md "Option A": a folder of *.json files, each
-    // listing one or more allow-listed hosts for the custom uses: URL feature. Only hosts listed
-    // here ever get a token attached to their action-download request.
+    // Config schema for docs/feature/secure_app_id.md: a folder of *.json files, each listing one
+    // or more allow-listed hosts for the custom uses: URL feature. Only hosts listed here ever get
+    // a token attached to their action-download request. A host entry may set a host-level default
+    // App (appId/privateKeyPath/installationId) and/or per-owner overrides under "orgs" so
+    // different orgs on the same GHE host can be backed by different GitHub Apps.
     public sealed class CrossHostAppConfigFile
     {
         public List<CrossHostAppEntry> Hosts { get; set; }
@@ -27,6 +29,24 @@ namespace GitHub.Runner.Worker
     public sealed class CrossHostAppEntry
     {
         public string Host { get; set; }
+        public string AppId { get; set; }
+        public string PrivateKeyPath { get; set; }
+        public string InstallationId { get; set; }
+        public List<CrossHostAppOrgEntry> Orgs { get; set; }
+    }
+
+    public sealed class CrossHostAppOrgEntry
+    {
+        public string Owner { get; set; }
+        public string AppId { get; set; }
+        public string PrivateKeyPath { get; set; }
+        public string InstallationId { get; set; }
+    }
+
+    // Resolved, already-validated App credential for a specific host (and optionally owner),
+    // independent of whether it came from a host-level default or a per-org override.
+    internal sealed class CrossHostCredential
+    {
         public string AppId { get; set; }
         public string PrivateKeyPath { get; set; }
         public string InstallationId { get; set; }
@@ -54,8 +74,13 @@ namespace GitHub.Runner.Worker
         private readonly ConcurrentDictionary<string, (string Token, DateTime ExpiresAtUtc)> _tokenCache = new(StringComparer.OrdinalIgnoreCase);
 
         private volatile bool _loaded;
-        private Dictionary<string, CrossHostAppEntry> _allowList = new(StringComparer.OrdinalIgnoreCase);
+        // Host-level default App, used for any owner on that host without a more specific "orgs" entry.
+        private Dictionary<string, CrossHostCredential> _hostDefaults = new(StringComparer.OrdinalIgnoreCase);
+        // Per-owner overrides, keyed by "{host}|{owner}" (case-insensitive), so different orgs on the
+        // same GHE host can be backed by different GitHub Apps.
+        private Dictionary<string, CrossHostCredential> _orgOverrides = new(StringComparer.OrdinalIgnoreCase);
         private Dictionary<string, string> _invalidHostReasons = new(StringComparer.OrdinalIgnoreCase);
+        private Dictionary<string, string> _invalidOrgReasons = new(StringComparer.OrdinalIgnoreCase);
 
         public async Task<string> TryGetTokenAsync(IExecutionContext executionContext, string host, string owner)
         {
@@ -65,20 +90,37 @@ namespace GitHub.Runner.Worker
 
             EnsureAllowListLoaded();
 
-            // Fail loud for a host that's listed but broken, rather than silently degrading to an
-            // anonymous request the admin never intended.
-            if (_invalidHostReasons.TryGetValue(host, out var reason))
+            var orgKey = GetOrgKey(host, owner);
+            var cacheKey = orgKey;
+
+            // Fail loud for an entry that's listed but broken, rather than silently degrading to an
+            // anonymous request the admin never intended. A broken per-org override takes precedence
+            // over a (possibly fine) host-level default, since it's the more specific match.
+            if (_invalidOrgReasons.TryGetValue(orgKey, out var orgReason))
             {
-                throw new InvalidOperationException($"Cross-host app entry for host '{host}' is misconfigured: {reason}");
+                throw new InvalidOperationException($"Cross-host app entry for owner '{owner}' on host '{host}' is misconfigured: {orgReason}");
             }
 
-            if (!_allowList.TryGetValue(host, out var entry))
+            CrossHostCredential credential;
+            if (_orgOverrides.TryGetValue(orgKey, out credential))
             {
-                // Not allow-listed at all: anonymous request, this is the normal/expected case.
+                // Matched a per-org override, nothing more to check.
+            }
+            else if (_invalidHostReasons.TryGetValue(host, out var hostReason))
+            {
+                throw new InvalidOperationException($"Cross-host app entry for host '{host}' is misconfigured: {hostReason}");
+            }
+            else if (_hostDefaults.TryGetValue(host, out credential))
+            {
+                // Matched the host-level default App.
+            }
+            else
+            {
+                // Not allow-listed at all for this host/owner: anonymous request, the normal/expected case.
                 return null;
             }
 
-            if (_tokenCache.TryGetValue(host, out var cached) && cached.ExpiresAtUtc > DateTime.UtcNow.AddMinutes(5))
+            if (_tokenCache.TryGetValue(cacheKey, out var cached) && cached.ExpiresAtUtc > DateTime.UtcNow.AddMinutes(5))
             {
                 return cached.Token;
             }
@@ -87,21 +129,21 @@ namespace GitHub.Runner.Worker
             try
             {
                 // Re-check now that we hold the lock in case a concurrent download already minted one.
-                if (_tokenCache.TryGetValue(host, out cached) && cached.ExpiresAtUtc > DateTime.UtcNow.AddMinutes(5))
+                if (_tokenCache.TryGetValue(cacheKey, out cached) && cached.ExpiresAtUtc > DateTime.UtcNow.AddMinutes(5))
                 {
                     return cached.Token;
                 }
 
-                var jwt = BuildAppJwt(entry.AppId, entry.PrivateKeyPath);
-                var apiBase = GetApiBase(entry.Host);
-                var installationId = entry.InstallationId;
+                var jwt = BuildAppJwt(credential.AppId, credential.PrivateKeyPath);
+                var apiBase = GetApiBase(host);
+                var installationId = credential.InstallationId;
                 if (string.IsNullOrEmpty(installationId))
                 {
-                    installationId = await ResolveInstallationIdAsync(executionContext, apiBase, jwt, owner, entry.Host);
+                    installationId = await ResolveInstallationIdAsync(executionContext, apiBase, jwt, owner, host);
                 }
 
-                var minted = await MintInstallationTokenAsync(executionContext, apiBase, jwt, installationId, entry.Host);
-                _tokenCache[host] = minted;
+                var minted = await MintInstallationTokenAsync(executionContext, apiBase, jwt, installationId, host);
+                _tokenCache[cacheKey] = minted;
                 return minted.Token;
             }
             finally
@@ -109,6 +151,8 @@ namespace GitHub.Runner.Worker
                 _mintLock.Release();
             }
         }
+
+        private static string GetOrgKey(string host, string owner) => $"{host}|{owner}";
 
         private void EnsureAllowListLoaded()
         {
@@ -124,16 +168,24 @@ namespace GitHub.Runner.Worker
                     return;
                 }
 
-                var allowList = new Dictionary<string, CrossHostAppEntry>(StringComparer.OrdinalIgnoreCase);
+                var hostDefaults = new Dictionary<string, CrossHostCredential>(StringComparer.OrdinalIgnoreCase);
+                var orgOverrides = new Dictionary<string, CrossHostCredential>(StringComparer.OrdinalIgnoreCase);
                 var invalidHostReasons = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
-                LoadAllowList(allowList, invalidHostReasons);
-                _allowList = allowList;
+                var invalidOrgReasons = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
+                LoadAllowList(hostDefaults, orgOverrides, invalidHostReasons, invalidOrgReasons);
+                _hostDefaults = hostDefaults;
+                _orgOverrides = orgOverrides;
                 _invalidHostReasons = invalidHostReasons;
+                _invalidOrgReasons = invalidOrgReasons;
                 _loaded = true;
             }
         }
 
-        private void LoadAllowList(Dictionary<string, CrossHostAppEntry> allowList, Dictionary<string, string> invalidHostReasons)
+        private void LoadAllowList(
+            Dictionary<string, CrossHostCredential> hostDefaults,
+            Dictionary<string, CrossHostCredential> orgOverrides,
+            Dictionary<string, string> invalidHostReasons,
+            Dictionary<string, string> invalidOrgReasons)
         {
             var dir = Environment.GetEnvironmentVariable(DefaultAllowListDirEnv);
             if (string.IsNullOrEmpty(dir))
@@ -147,6 +199,7 @@ namespace GitHub.Runner.Worker
                 return;
             }
 
+            var seenHosts = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
             foreach (var file in Directory.GetFiles(dir, "*.json", SearchOption.TopDirectoryOnly).OrderBy(f => f, StringComparer.OrdinalIgnoreCase))
             {
                 List<CrossHostAppEntry> entries;
@@ -174,28 +227,82 @@ namespace GitHub.Runner.Worker
                         continue;
                     }
 
-                    if (allowList.ContainsKey(entry.Host) || invalidHostReasons.ContainsKey(entry.Host))
+                    if (!seenHosts.Add(entry.Host))
                     {
                         Trace.Warning($"Duplicate cross-host app entry for host '{entry.Host}' in '{file}'; keeping the first one loaded.");
                         continue;
                     }
 
-                    if (string.IsNullOrEmpty(entry.AppId) || string.IsNullOrEmpty(entry.PrivateKeyPath))
+                    var hasHostLevelAppId = !string.IsNullOrEmpty(entry.AppId);
+                    var hasHostLevelKeyPath = !string.IsNullOrEmpty(entry.PrivateKeyPath);
+                    if (hasHostLevelAppId || hasHostLevelKeyPath)
                     {
-                        invalidHostReasons[entry.Host] = $"'{file}' is missing required field(s) appId/privateKeyPath.";
+                        var hostCredential = ValidateCredential(entry.AppId, entry.PrivateKeyPath, entry.InstallationId, file, out var hostError);
+                        if (hostCredential != null)
+                        {
+                            hostDefaults[entry.Host] = hostCredential;
+                            Trace.Info($"Loaded cross-host app default for host '{entry.Host}'.");
+                        }
+                        else
+                        {
+                            invalidHostReasons[entry.Host] = hostError;
+                        }
+                    }
+
+                    if (entry.Orgs == null)
+                    {
                         continue;
                     }
 
-                    if (!File.Exists(entry.PrivateKeyPath))
+                    foreach (var org in entry.Orgs)
                     {
-                        invalidHostReasons[entry.Host] = $"private key file '{entry.PrivateKeyPath}' not found.";
-                        continue;
-                    }
+                        if (string.IsNullOrEmpty(org?.Owner))
+                        {
+                            Trace.Warning($"Skipping cross-host app org entry for host '{entry.Host}' in '{file}' with no owner.");
+                            continue;
+                        }
 
-                    allowList[entry.Host] = entry;
-                    Trace.Info($"Loaded cross-host app allow-list entry for host '{entry.Host}'.");
+                        var orgKey = GetOrgKey(entry.Host, org.Owner);
+                        if (orgOverrides.ContainsKey(orgKey) || invalidOrgReasons.ContainsKey(orgKey))
+                        {
+                            Trace.Warning($"Duplicate cross-host app entry for owner '{org.Owner}' on host '{entry.Host}' in '{file}'; keeping the first one loaded.");
+                            continue;
+                        }
+
+                        var orgCredential = ValidateCredential(org.AppId, org.PrivateKeyPath, org.InstallationId, file, out var orgError);
+                        if (orgCredential != null)
+                        {
+                            orgOverrides[orgKey] = orgCredential;
+                            Trace.Info($"Loaded cross-host app override for owner '{org.Owner}' on host '{entry.Host}'.");
+                        }
+                        else
+                        {
+                            invalidOrgReasons[orgKey] = orgError;
+                        }
+                    }
                 }
             }
+        }
+
+        // Validates appId/privateKeyPath and returns a resolved credential, or null + an error message
+        // via `error` if the entry is missing required fields or the key file doesn't exist. Doesn't
+        // validate the PEM contents itself — that's checked (and fails loudly) at JWT-signing time.
+        private static CrossHostCredential ValidateCredential(string appId, string privateKeyPath, string installationId, string file, out string error)
+        {
+            if (string.IsNullOrEmpty(appId) || string.IsNullOrEmpty(privateKeyPath))
+            {
+                error = $"'{file}' is missing required field(s) appId/privateKeyPath.";
+                return null;
+            }
+
+            if (!File.Exists(privateKeyPath))
+            {
+                error = $"private key file '{privateKeyPath}' not found.";
+                return null;
+            }
+
+            error = null;
+            return new CrossHostCredential { AppId = appId, PrivateKeyPath = privateKeyPath, InstallationId = installationId };
         }
 
         // Signs a GitHub App JWT (RS256, <=10 minute lifetime per GitHub's rules) directly, rather than
