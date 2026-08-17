@@ -259,7 +259,7 @@ namespace GitHub.Runner.Common.Tests.Worker
                             ""appId"": ""111"",
                             ""privateKeyPath"": ""{defaultKeyPath.Replace("\\", "\\\\")}"",
                             ""installationId"": ""999"",
-                            ""orgs"": [
+                            ""owners"": [
                                 {{ ""owner"": ""team-a"", ""appId"": ""222"", ""privateKeyPath"": ""{teamAKeyPath.Replace("\\", "\\\\")}"", ""installationId"": ""333"" }}
                             ]
                         }}
@@ -301,7 +301,7 @@ namespace GitHub.Runner.Common.Tests.Worker
         [Fact]
         [Trait("Level", "L0")]
         [Trait("Category", "Worker")]
-        public async void TryGetTokenAsync_OrgsOnlyNoHostDefault_UnlistedOwnerIsAnonymous()
+        public async void TryGetTokenAsync_OwnersOnlyNoHostDefault_UnlistedOwnerIsAnonymous()
         {
             try
             {
@@ -311,7 +311,7 @@ namespace GitHub.Runner.Common.Tests.Worker
                     ""hosts"": [
                         {{
                             ""host"": ""github.kp.org"",
-                            ""orgs"": [
+                            ""owners"": [
                                 {{ ""owner"": ""team-a"", ""appId"": ""222"", ""privateKeyPath"": ""{teamAKeyPath.Replace("\\", "\\\\")}"", ""installationId"": ""333"" }}
                             ]
                         }}
@@ -335,7 +335,7 @@ namespace GitHub.Runner.Common.Tests.Worker
         [Fact]
         [Trait("Level", "L0")]
         [Trait("Category", "Worker")]
-        public async void TryGetTokenAsync_BrokenOrgOverride_ThrowsButOtherOrgsStillWork()
+        public async void TryGetTokenAsync_BrokenOwnerOverride_ThrowsButOtherOwnersStillWork()
         {
             try
             {
@@ -345,7 +345,7 @@ namespace GitHub.Runner.Common.Tests.Worker
                     ""hosts"": [
                         {{
                             ""host"": ""github.kp.org"",
-                            ""orgs"": [
+                            ""owners"": [
                                 {{ ""owner"": ""team-a"", ""appId"": ""222"", ""privateKeyPath"": ""{teamAKeyPath.Replace("\\", "\\\\")}"", ""installationId"": ""333"" }},
                                 {{ ""owner"": ""team-broken"", ""appId"": ""444"", ""privateKeyPath"": ""/does/not/exist.pem"" }}
                             ]

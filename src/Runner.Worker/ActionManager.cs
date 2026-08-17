@@ -1028,6 +1028,21 @@ namespace GitHub.Runner.Worker
             var defaultAccessToken = executionContext.GetGitHubContext("token");
             var result = new Dictionary<string, WebApi.ActionDownloadInfo>(StringComparer.Ordinal);
 
+            // A uses: URL that happens to point at the runner's own default server isn't actually
+            // "custom" -- normalize it away (in place, before anything else reads .Url) so the action
+            // gets the normal server-resolved treatment (policy enforcement, SHA pinning, immutable
+            // action verification) instead of the custom-host bypass path below.
+            foreach (var action in actions)
+            {
+                if (action.Reference is Pipelines.RepositoryPathReference repoRef &&
+                    !string.IsNullOrEmpty(repoRef.Url) &&
+                    Uri.TryCreate(repoRef.Url, UriKind.Absolute, out var usesUri) &&
+                    IsDefaultServerHost(executionContext, usesUri.Host))
+                {
+                    repoRef.Url = null;
+                }
+            }
+
             // Actions referencing an explicit uses: URL bypass the server-side resolve call entirely;
             // their download info is built directly against the custom host. Everything else still
             // goes through the normal server-resolved flow below.
@@ -1640,6 +1655,18 @@ namespace GitHub.Runner.Worker
             return string.IsNullOrEmpty(repositoryReference.Url)
                 ? $"{repositoryReference.Name}@{repositoryReference.Ref}"
                 : $"{repositoryReference.Url}/{repositoryReference.Name}@{repositoryReference.Ref}";
+        }
+
+        /// <summary>
+        /// True when host is the runner's own registered server (context "server_url", or
+        /// github.com if unset) -- i.e., a uses: URL that isn't actually pointing anywhere custom.
+        /// </summary>
+        private static bool IsDefaultServerHost(IExecutionContext executionContext, string host)
+        {
+            var serverUrl = executionContext.GetGitHubContext("server_url");
+            serverUrl = !string.IsNullOrEmpty(serverUrl) ? serverUrl : "https://github.com";
+            return Uri.TryCreate(serverUrl, UriKind.Absolute, out var serverUri) &&
+                string.Equals(serverUri.Host, host, StringComparison.OrdinalIgnoreCase);
         }
 
         /// <summary>

@@ -51,7 +51,7 @@ steps:
 
   # Custom host, authenticated via an allow-listed GitHub App if configured
   # (see docs/feature/secure_app_id.md), otherwise an anonymous request
-  - uses: https://github.kp.org/some-org/some-action@v1
+  - uses: https://github.kp.org/owner/some-action@v1
 ```
 
 ## Keeping this doc current

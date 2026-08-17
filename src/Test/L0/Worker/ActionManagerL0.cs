@@ -163,6 +163,64 @@ namespace GitHub.Runner.Common.Tests.Worker
         [Fact]
         [Trait("Level", "L0")]
         [Trait("Category", "Worker")]
+        public async void PrepareActions_UsesUrlMatchingDefaultServer_ResolvesNormallyNotAsCustomHost()
+        {
+            try
+            {
+                // Arrange
+                Setup();
+                const string ActionName = "ownerName/sample-action";
+                var actions = new List<Pipelines.ActionStep>
+                {
+                    new Pipelines.ActionStep()
+                    {
+                        Name = "action",
+                        Id = Guid.NewGuid(),
+                        Reference = new Pipelines.RepositoryPathReference()
+                        {
+                            Name = ActionName,
+                            Ref = "main",
+                            RepositoryType = "GitHub",
+                            // Points at the runner's own registered server, not a genuinely custom host
+                            Url = "https://kaiser.ghe.com",
+                        }
+                    }
+                };
+
+                _ec.Setup(x => x.GetGitHubContext("server_url")).Returns("https://kaiser.ghe.com");
+
+                string archiveLink = GetLinkToActionArchive("https://api.github.com", ActionName, "main");
+                string archiveFile = await CreateRepoArchive();
+                using var stream = File.OpenRead(archiveFile);
+                var mockClientHandler = new Mock<HttpClientHandler>();
+                mockClientHandler.Protected().Setup<Task<HttpResponseMessage>>("SendAsync", ItExpr.Is<HttpRequestMessage>(m => m.RequestUri == new Uri(archiveLink)), ItExpr.IsAny<CancellationToken>())
+                    .ReturnsAsync(new HttpResponseMessage(HttpStatusCode.OK) { Content = new StreamContent(stream) });
+
+                var mockHandlerFactory = new Mock<IHttpClientHandlerFactory>();
+                mockHandlerFactory.Setup(p => p.CreateClientHandler(It.IsAny<RunnerWebProxy>())).Returns(mockClientHandler.Object);
+                _hc.SetSingleton(mockHandlerFactory.Object);
+
+                //Act
+                await _actionManager.PrepareActionsAsync(_ec.Object, actions);
+
+                //Assert - a uses: URL matching the runner's own server is normalized away, so this
+                // goes through the normal server-resolved flow instead of the custom-host bypass.
+                _jobServer.Verify(x => x.ResolveActionDownloadInfoAsync(It.IsAny<Guid>(), It.IsAny<string>(), It.IsAny<Guid>(), It.IsAny<Guid>(), It.Is<ActionReferenceList>(actions => actions.Actions.Any(a => a.NameWithOwner == ActionName && a.Ref == "main")), It.IsAny<CancellationToken>()), Times.Once);
+
+                // No "_custom_..." namespacing -- this is the same destination as a plain owner/repo@ref action
+                var normalDestDirectory = Path.Combine(_hc.GetDirectory(WellKnownDirectory.Actions), ActionName, "main");
+                Assert.True(File.Exists(normalDestDirectory + ".completed"));
+                Assert.True(File.Exists(Path.Combine(normalDestDirectory, "action.yml")));
+            }
+            finally
+            {
+                Teardown();
+            }
+        }
+
+        [Fact]
+        [Trait("Level", "L0")]
+        [Trait("Category", "Worker")]
         public async void PrepareActions_DownloadActionFromDotCom_ZipFileError()
         {
             try

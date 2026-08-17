@@ -19,8 +19,8 @@ namespace GitHub.Runner.Worker
     // Config schema for docs/feature/secure_app_id.md: a folder of *.json files, each listing one
     // or more allow-listed hosts for the custom uses: URL feature. Only hosts listed here ever get
     // a token attached to their action-download request. A host entry may set a host-level default
-    // App (appId/privateKeyPath/installationId) and/or per-owner overrides under "orgs" so
-    // different orgs on the same GHE host can be backed by different GitHub Apps.
+    // App (appId/privateKeyPath/installationId) and/or per-owner overrides under "owners" so
+    // different owners (users or orgs) on the same GHE host can be backed by different GitHub Apps.
     public sealed class CrossHostAppConfigFile
     {
         public List<CrossHostAppEntry> Hosts { get; set; }
@@ -32,10 +32,10 @@ namespace GitHub.Runner.Worker
         public string AppId { get; set; }
         public string PrivateKeyPath { get; set; }
         public string InstallationId { get; set; }
-        public List<CrossHostAppOrgEntry> Orgs { get; set; }
+        public List<CrossHostAppOwnerEntry> Owners { get; set; }
     }
 
-    public sealed class CrossHostAppOrgEntry
+    public sealed class CrossHostAppOwnerEntry
     {
         public string Owner { get; set; }
         public string AppId { get; set; }
@@ -44,7 +44,7 @@ namespace GitHub.Runner.Worker
     }
 
     // Resolved, already-validated App credential for a specific host (and optionally owner),
-    // independent of whether it came from a host-level default or a per-org override.
+    // independent of whether it came from a host-level default or a per-owner override.
     internal sealed class CrossHostCredential
     {
         public string AppId { get; set; }
@@ -74,13 +74,13 @@ namespace GitHub.Runner.Worker
         private readonly ConcurrentDictionary<string, (string Token, DateTime ExpiresAtUtc)> _tokenCache = new(StringComparer.OrdinalIgnoreCase);
 
         private volatile bool _loaded;
-        // Host-level default App, used for any owner on that host without a more specific "orgs" entry.
+        // Host-level default App, used for any owner on that host without a more specific "owners" entry.
         private Dictionary<string, CrossHostCredential> _hostDefaults = new(StringComparer.OrdinalIgnoreCase);
-        // Per-owner overrides, keyed by "{host}|{owner}" (case-insensitive), so different orgs on the
+        // Per-owner overrides, keyed by "{host}|{owner}" (case-insensitive), so different owners on the
         // same GHE host can be backed by different GitHub Apps.
-        private Dictionary<string, CrossHostCredential> _orgOverrides = new(StringComparer.OrdinalIgnoreCase);
+        private Dictionary<string, CrossHostCredential> _ownerOverrides = new(StringComparer.OrdinalIgnoreCase);
         private Dictionary<string, string> _invalidHostReasons = new(StringComparer.OrdinalIgnoreCase);
-        private Dictionary<string, string> _invalidOrgReasons = new(StringComparer.OrdinalIgnoreCase);
+        private Dictionary<string, string> _invalidOwnerReasons = new(StringComparer.OrdinalIgnoreCase);
 
         public async Task<string> TryGetTokenAsync(IExecutionContext executionContext, string host, string owner)
         {
@@ -90,21 +90,21 @@ namespace GitHub.Runner.Worker
 
             EnsureAllowListLoaded();
 
-            var orgKey = GetOrgKey(host, owner);
-            var cacheKey = orgKey;
+            var ownerKey = GetOwnerKey(host, owner);
+            var cacheKey = ownerKey;
 
             // Fail loud for an entry that's listed but broken, rather than silently degrading to an
-            // anonymous request the admin never intended. A broken per-org override takes precedence
+            // anonymous request the admin never intended. A broken per-owner override takes precedence
             // over a (possibly fine) host-level default, since it's the more specific match.
-            if (_invalidOrgReasons.TryGetValue(orgKey, out var orgReason))
+            if (_invalidOwnerReasons.TryGetValue(ownerKey, out var ownerReason))
             {
-                throw new InvalidOperationException($"Cross-host app entry for owner '{owner}' on host '{host}' is misconfigured: {orgReason}");
+                throw new InvalidOperationException($"Cross-host app entry for owner '{owner}' on host '{host}' is misconfigured: {ownerReason}");
             }
 
             CrossHostCredential credential;
-            if (_orgOverrides.TryGetValue(orgKey, out credential))
+            if (_ownerOverrides.TryGetValue(ownerKey, out credential))
             {
-                // Matched a per-org override, nothing more to check.
+                // Matched a per-owner override, nothing more to check.
             }
             else if (_invalidHostReasons.TryGetValue(host, out var hostReason))
             {
@@ -152,7 +152,7 @@ namespace GitHub.Runner.Worker
             }
         }
 
-        private static string GetOrgKey(string host, string owner) => $"{host}|{owner}";
+        private static string GetOwnerKey(string host, string owner) => $"{host}|{owner}";
 
         private void EnsureAllowListLoaded()
         {
@@ -169,23 +169,23 @@ namespace GitHub.Runner.Worker
                 }
 
                 var hostDefaults = new Dictionary<string, CrossHostCredential>(StringComparer.OrdinalIgnoreCase);
-                var orgOverrides = new Dictionary<string, CrossHostCredential>(StringComparer.OrdinalIgnoreCase);
+                var ownerOverrides = new Dictionary<string, CrossHostCredential>(StringComparer.OrdinalIgnoreCase);
                 var invalidHostReasons = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
-                var invalidOrgReasons = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
-                LoadAllowList(hostDefaults, orgOverrides, invalidHostReasons, invalidOrgReasons);
+                var invalidOwnerReasons = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
+                LoadAllowList(hostDefaults, ownerOverrides, invalidHostReasons, invalidOwnerReasons);
                 _hostDefaults = hostDefaults;
-                _orgOverrides = orgOverrides;
+                _ownerOverrides = ownerOverrides;
                 _invalidHostReasons = invalidHostReasons;
-                _invalidOrgReasons = invalidOrgReasons;
+                _invalidOwnerReasons = invalidOwnerReasons;
                 _loaded = true;
             }
         }
 
         private void LoadAllowList(
             Dictionary<string, CrossHostCredential> hostDefaults,
-            Dictionary<string, CrossHostCredential> orgOverrides,
+            Dictionary<string, CrossHostCredential> ownerOverrides,
             Dictionary<string, string> invalidHostReasons,
-            Dictionary<string, string> invalidOrgReasons)
+            Dictionary<string, string> invalidOwnerReasons)
         {
             var dir = Environment.GetEnvironmentVariable(DefaultAllowListDirEnv);
             if (string.IsNullOrEmpty(dir))
@@ -249,35 +249,35 @@ namespace GitHub.Runner.Worker
                         }
                     }
 
-                    if (entry.Orgs == null)
+                    if (entry.Owners == null)
                     {
                         continue;
                     }
 
-                    foreach (var org in entry.Orgs)
+                    foreach (var ownerEntry in entry.Owners)
                     {
-                        if (string.IsNullOrEmpty(org?.Owner))
+                        if (string.IsNullOrEmpty(ownerEntry?.Owner))
                         {
-                            Trace.Warning($"Skipping cross-host app org entry for host '{entry.Host}' in '{file}' with no owner.");
+                            Trace.Warning($"Skipping cross-host app owner entry for host '{entry.Host}' in '{file}' with no owner.");
                             continue;
                         }
 
-                        var orgKey = GetOrgKey(entry.Host, org.Owner);
-                        if (orgOverrides.ContainsKey(orgKey) || invalidOrgReasons.ContainsKey(orgKey))
+                        var ownerKey = GetOwnerKey(entry.Host, ownerEntry.Owner);
+                        if (ownerOverrides.ContainsKey(ownerKey) || invalidOwnerReasons.ContainsKey(ownerKey))
                         {
-                            Trace.Warning($"Duplicate cross-host app entry for owner '{org.Owner}' on host '{entry.Host}' in '{file}'; keeping the first one loaded.");
+                            Trace.Warning($"Duplicate cross-host app entry for owner '{ownerEntry.Owner}' on host '{entry.Host}' in '{file}'; keeping the first one loaded.");
                             continue;
                         }
 
-                        var orgCredential = ValidateCredential(org.AppId, org.PrivateKeyPath, org.InstallationId, file, out var orgError);
-                        if (orgCredential != null)
+                        var ownerCredential = ValidateCredential(ownerEntry.AppId, ownerEntry.PrivateKeyPath, ownerEntry.InstallationId, file, out var ownerError);
+                        if (ownerCredential != null)
                         {
-                            orgOverrides[orgKey] = orgCredential;
-                            Trace.Info($"Loaded cross-host app override for owner '{org.Owner}' on host '{entry.Host}'.");
+                            ownerOverrides[ownerKey] = ownerCredential;
+                            Trace.Info($"Loaded cross-host app override for owner '{ownerEntry.Owner}' on host '{entry.Host}'.");
                         }
                         else
                         {
-                            invalidOrgReasons[orgKey] = orgError;
+                            invalidOwnerReasons[ownerKey] = ownerError;
                         }
                     }
                 }
