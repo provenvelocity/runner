@@ -712,7 +712,7 @@ namespace GitHub.Runner.Worker
                 }
                 else
                 {
-                    actionDirectory = Path.Combine(HostContext.GetDirectory(WellKnownDirectory.Actions), repoAction.Name.Replace(Path.AltDirectorySeparatorChar, Path.DirectorySeparatorChar), repoAction.Ref);
+                    actionDirectory = GetActionDestinationDirectory(repoAction.Name, repoAction.Ref, repoAction.Url);
                     if (!string.IsNullOrEmpty(repoAction.Path))
                     {
                         actionDirectory = Path.Combine(actionDirectory, repoAction.Path);
@@ -1025,13 +1025,39 @@ namespace GitHub.Runner.Worker
         {
             executionContext.Output("Getting action download info");
 
-            // Convert to action reference
-            var actionReferences = actions
-                .GroupBy(x => GetDownloadInfoLookupKey(x))
-                .Where(x => !string.IsNullOrEmpty(x.Key))
-                .Select(x =>
+            var defaultAccessToken = executionContext.GetGitHubContext("token");
+            var result = new Dictionary<string, WebApi.ActionDownloadInfo>(StringComparer.Ordinal);
+
+            // Actions referencing an explicit uses: URL bypass the server-side resolve call entirely;
+            // their download info is built directly against the custom host. Everything else still
+            // goes through the normal server-resolved flow below.
+            var serverResolvedActions = new List<Pipelines.ActionStep>();
+            foreach (var group in actions.GroupBy(x => GetDownloadInfoLookupKey(x)).Where(x => !string.IsNullOrEmpty(x.Key)))
+            {
+                var action = group.First();
+                var repositoryReference = action.Reference as Pipelines.RepositoryPathReference;
+                ArgUtil.NotNull(repositoryReference, nameof(repositoryReference));
+
+                if (!string.IsNullOrEmpty(repositoryReference.Url))
                 {
-                    var action = x.First();
+                    result[group.Key] = BuildCustomUrlDownloadInfo(repositoryReference, defaultAccessToken);
+                }
+                else
+                {
+                    serverResolvedActions.Add(action);
+                }
+            }
+
+            // Nothing left to resolve via the service?
+            if (serverResolvedActions.Count == 0)
+            {
+                return result;
+            }
+
+            // Convert to action reference
+            var actionReferences = serverResolvedActions
+                .Select(action =>
+                {
                     var repositoryReference = action.Reference as Pipelines.RepositoryPathReference;
                     ArgUtil.NotNull(repositoryReference, nameof(repositoryReference));
                     return new WebApi.ActionReference
@@ -1042,12 +1068,6 @@ namespace GitHub.Runner.Worker
                     };
                 })
                 .ToList();
-
-            // Nothing to resolve?
-            if (actionReferences.Count == 0)
-            {
-                return new Dictionary<string, WebApi.ActionDownloadInfo>();
-            }
 
             // Pass lockfile dependencies to Launch when present, so it can
             // perform ref-scoped policy matching with the original refs.
@@ -1113,7 +1133,6 @@ namespace GitHub.Runner.Worker
 
             ArgUtil.NotNull(actionDownloadInfos, nameof(actionDownloadInfos));
             ArgUtil.NotNull(actionDownloadInfos.Actions, nameof(actionDownloadInfos.Actions));
-            var defaultAccessToken = executionContext.GetGitHubContext("token");
 
             foreach (var actionDownloadInfo in actionDownloadInfos.Actions.Values)
             {
@@ -1127,7 +1146,12 @@ namespace GitHub.Runner.Worker
                 }
             }
 
-            return actionDownloadInfos.Actions;
+            foreach (var kvp in actionDownloadInfos.Actions)
+            {
+                result[kvp.Key] = kvp.Value;
+            }
+
+            return result;
         }
 
         /// <summary>
@@ -1190,7 +1214,7 @@ namespace GitHub.Runner.Worker
             ArgUtil.NotNullOrEmpty(downloadInfo.Ref, nameof(downloadInfo.ResolvedNameWithOwner));
             ArgUtil.NotNullOrEmpty(downloadInfo.Ref, nameof(downloadInfo.ResolvedSha));
 
-            string destDirectory = Path.Combine(HostContext.GetDirectory(WellKnownDirectory.Actions), downloadInfo.NameWithOwner.Replace(Path.AltDirectorySeparatorChar, Path.DirectorySeparatorChar), downloadInfo.Ref);
+            string destDirectory = GetActionDestinationDirectory(downloadInfo.NameWithOwner, downloadInfo.Ref, downloadInfo.SourceUrl);
             string watermarkFile = GetWatermarkFilePath(destDirectory);
             if (File.Exists(watermarkFile))
             {
@@ -1417,7 +1441,7 @@ namespace GitHub.Runner.Worker
             }
             var setupInfo = new ActionSetupInfo();
             var actionContainer = new ActionContainer();
-            string destDirectory = Path.Combine(HostContext.GetDirectory(WellKnownDirectory.Actions), repositoryReference.Name.Replace(Path.AltDirectorySeparatorChar, Path.DirectorySeparatorChar), repositoryReference.Ref);
+            string destDirectory = GetActionDestinationDirectory(repositoryReference.Name, repositoryReference.Ref, repositoryReference.Url);
             string actionEntryDirectory = destDirectory;
             string dockerFileRelativePath = repositoryReference.Name;
             ArgUtil.NotNull(repositoryReference, nameof(repositoryReference));
@@ -1613,7 +1637,54 @@ namespace GitHub.Runner.Worker
 
             ArgUtil.NotNullOrEmpty(repositoryReference.Name, nameof(repositoryReference.Name));
             ArgUtil.NotNullOrEmpty(repositoryReference.Ref, nameof(repositoryReference.Ref));
-            return $"{repositoryReference.Name}@{repositoryReference.Ref}";
+            return string.IsNullOrEmpty(repositoryReference.Url)
+                ? $"{repositoryReference.Name}@{repositoryReference.Ref}"
+                : $"{repositoryReference.Url}/{repositoryReference.Name}@{repositoryReference.Ref}";
+        }
+
+        /// <summary>
+        /// Builds action download info directly from a uses: URL, bypassing the server-side resolve
+        /// call entirely. Uses the same github.com vs GHES host convention as the rest of the runner
+        /// (UrlUtil.IsHostedServer) to determine the REST API host, and falls back to the job's own
+        /// GITHUB_TOKEN for authentication since there's no per-action token issuance for hosts outside
+        /// the runner's configured server.
+        /// </summary>
+        private static WebApi.ActionDownloadInfo BuildCustomUrlDownloadInfo(Pipelines.RepositoryPathReference repositoryReference, string defaultAccessToken)
+        {
+            var uriBuilder = new UriBuilder(repositoryReference.Url);
+            var apiBase = UrlUtil.IsHostedServer(uriBuilder)
+                ? $"{uriBuilder.Scheme}://api.{uriBuilder.Host}"
+                : $"{repositoryReference.Url}/api/v3";
+
+            return new WebApi.ActionDownloadInfo
+            {
+                NameWithOwner = repositoryReference.Name,
+                ResolvedNameWithOwner = repositoryReference.Name,
+                Ref = repositoryReference.Ref,
+                // No server-side resolve call means no real commit SHA is available; the ref itself
+                // stands in as the cache key for the (optional) action archive cache.
+                ResolvedSha = repositoryReference.Ref,
+                TarballUrl = $"{apiBase}/repos/{repositoryReference.Name}/tarball/{repositoryReference.Ref}",
+                ZipballUrl = $"{apiBase}/repos/{repositoryReference.Name}/zipball/{repositoryReference.Ref}",
+                Authentication = new WebApi.ActionDownloadAuthentication { Token = defaultAccessToken },
+                SourceUrl = repositoryReference.Url,
+            };
+        }
+
+        /// <summary>
+        /// Resolves the on-disk directory an action is downloaded to/read from. When sourceUrl is set
+        /// (a uses: action with an explicit custom URL) the directory is namespaced under that host so
+        /// it can never collide with the same owner/repo@ref resolved from the runner's default server.
+        /// </summary>
+        private string GetActionDestinationDirectory(string nameWithOwner, string gitRef, string sourceUrl)
+        {
+            var basePath = HostContext.GetDirectory(WellKnownDirectory.Actions);
+            if (!string.IsNullOrEmpty(sourceUrl))
+            {
+                basePath = Path.Combine(basePath, "_custom_" + sourceUrl.Replace("://", "_").Replace(":", "_"));
+            }
+
+            return Path.Combine(basePath, nameWithOwner.Replace(Path.AltDirectorySeparatorChar, Path.DirectorySeparatorChar), gitRef);
         }
 
         private AuthenticationHeaderValue CreateAuthHeader(IExecutionContext executionContext, string downloadUrl, string token)

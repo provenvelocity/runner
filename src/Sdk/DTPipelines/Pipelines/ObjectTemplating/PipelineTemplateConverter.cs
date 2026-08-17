@@ -634,6 +634,40 @@ namespace GitHub.DistributedTask.Pipelines.ObjectTemplating
                         Path = selfPath
                     };
                 }
+                else if (Uri.TryCreate(usesString.Value, UriKind.Absolute, out var usesUri) &&
+                    (String.Equals(usesUri.Scheme, Uri.UriSchemeHttp, StringComparison.OrdinalIgnoreCase) ||
+                     String.Equals(usesUri.Scheme, Uri.UriSchemeHttps, StringComparison.OrdinalIgnoreCase)))
+                {
+                    // Fully-qualified uses: URL. The org/repo[/path]@ref portion lives in the URL path;
+                    // the scheme+host(+port) overrides the runner's normally server-derived host for this action only.
+                    var usesSegments = usesUri.AbsolutePath.TrimStart('/').Split('@');
+                    var pathSegments = usesSegments[0].Split(new[] { '/', '\\' }, StringSplitOptions.RemoveEmptyEntries);
+                    var gitRef = usesSegments.Length == 2 ? usesSegments[1] : String.Empty;
+
+                    if (usesSegments.Length != 2 ||
+                        pathSegments.Length < 2 ||
+                        String.IsNullOrEmpty(pathSegments[0]) ||
+                        String.IsNullOrEmpty(pathSegments[1]) ||
+                        String.IsNullOrEmpty(gitRef))
+                    {
+                        // todo: loc
+                        context.Error(usesString, $"Expected format {{scheme}}://{{host}}/{{org}}/{{repo}}[/path]@ref. Actual '{usesString.Value}'");
+                    }
+                    else
+                    {
+                        var repositoryName = $"{pathSegments[0]}/{pathSegments[1]}";
+                        var directoryPath = pathSegments.Length > 2 ? String.Join("/", pathSegments.Skip(2)) : String.Empty;
+
+                        result.Reference = new RepositoryPathReference
+                        {
+                            RepositoryType = RepositoryTypes.GitHub,
+                            Name = repositoryName,
+                            Ref = gitRef,
+                            Path = directoryPath,
+                            Url = usesUri.GetLeftPart(UriPartial.Authority),
+                        };
+                    }
+                }
                 else
                 {
                     var usesSegments = usesString.Value.Split('@');

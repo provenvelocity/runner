@@ -79,6 +79,7 @@ namespace GitHub.DistributedTask.Pipelines
             this.Ref = referenceToClone.Ref;
             this.RepositoryType = referenceToClone.RepositoryType;
             this.Path = referenceToClone.Path;
+            this.Url = referenceToClone.Url;
         }
 
         [DataMember(EmitDefaultValue = false)]
@@ -119,6 +120,17 @@ namespace GitHub.DistributedTask.Pipelines
         /// </summary>
         [DataMember(EmitDefaultValue = false)]
         public string Path
+        {
+            get;
+            set;
+        }
+
+        /// <summary>
+        /// Explicit scheme+host (and optional port) parsed from a fully-qualified uses: URL.
+        /// When set, action download bypasses the normal server-resolved host and targets this one instead.
+        /// </summary>
+        [DataMember(EmitDefaultValue = false)]
+        public string Url
         {
             get;
             set;

@@ -106,6 +106,63 @@ namespace GitHub.Runner.Common.Tests.Worker
         [Fact]
         [Trait("Level", "L0")]
         [Trait("Category", "Worker")]
+        public async void PrepareActions_DownloadActionFromCustomUsesUrl_BypassesResolveService()
+        {
+            try
+            {
+                // Arrange
+                Setup();
+                const string ActionName = "ownerName/sample-action";
+                const string CustomUrl = "https://custom-ghes.example.com";
+                var actions = new List<Pipelines.ActionStep>
+                {
+                    new Pipelines.ActionStep()
+                    {
+                        Name = "action",
+                        Id = Guid.NewGuid(),
+                        Reference = new Pipelines.RepositoryPathReference()
+                        {
+                            Name = ActionName,
+                            Ref = "main",
+                            RepositoryType = "GitHub",
+                            Url = CustomUrl,
+                        }
+                    }
+                };
+
+                // Custom hosts are treated as GHES-style (non-hosted), so the archive is expected under /api/v3
+                string archiveLink = GetLinkToActionArchive($"{CustomUrl}/api/v3", ActionName, "main");
+                string archiveFile = await CreateRepoArchive();
+                using var stream = File.OpenRead(archiveFile);
+                var mockClientHandler = new Mock<HttpClientHandler>();
+                mockClientHandler.Protected().Setup<Task<HttpResponseMessage>>("SendAsync", ItExpr.Is<HttpRequestMessage>(m => m.RequestUri == new Uri(archiveLink)), ItExpr.IsAny<CancellationToken>())
+                    .ReturnsAsync(new HttpResponseMessage(HttpStatusCode.OK) { Content = new StreamContent(stream) });
+
+                var mockHandlerFactory = new Mock<IHttpClientHandlerFactory>();
+                mockHandlerFactory.Setup(p => p.CreateClientHandler(It.IsAny<RunnerWebProxy>())).Returns(mockClientHandler.Object);
+                _hc.SetSingleton(mockHandlerFactory.Object);
+
+                //Act
+                await _actionManager.PrepareActionsAsync(_ec.Object, actions);
+
+                //Assert - the backend resolve services are never consulted for custom-URL actions
+                _jobServer.Verify(x => x.ResolveActionDownloadInfoAsync(It.IsAny<Guid>(), It.IsAny<string>(), It.IsAny<Guid>(), It.IsAny<Guid>(), It.IsAny<ActionReferenceList>(), It.IsAny<CancellationToken>()), Times.Never);
+                _launchServer.Verify(x => x.ResolveActionsDownloadInfoAsync(It.IsAny<Guid>(), It.IsAny<Guid>(), It.IsAny<ActionReferenceList>(), It.IsAny<CancellationToken>(), It.IsAny<bool>()), Times.Never);
+
+                // The on-disk cache is namespaced under the custom host so it can't collide with the default host's cache
+                var destDirectory = Path.Combine(_hc.GetDirectory(WellKnownDirectory.Actions), "_custom_https_custom-ghes.example.com", ActionName, "main");
+                Assert.True(File.Exists(destDirectory + ".completed"));
+                Assert.True(File.Exists(Path.Combine(destDirectory, "action.yml")));
+            }
+            finally
+            {
+                Teardown();
+            }
+        }
+
+        [Fact]
+        [Trait("Level", "L0")]
+        [Trait("Category", "Worker")]
         public async void PrepareActions_DownloadActionFromDotCom_ZipFileError()
         {
             try
