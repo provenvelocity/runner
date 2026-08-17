@@ -24,7 +24,7 @@ attacker-controlled host.
 download request. Every other host gets an anonymous request (fine for public repos) — never the
 primary `GITHUB_TOKEN`, never any other host's credential.
 
-## How to set this up
+## Getting started (step by step)
 
 ### 1. Create a GitHub App on the target host
 
@@ -158,110 +158,54 @@ All of these come from `CrossHostAppTokenProvider` and are visible in the job's 
 A host that's simply **not mentioned** in any allow-list file is not an error — it's the normal
 case for public actions and results in a plain anonymous download.
 
-## What already exists in this codebase vs. what's net-new
+## How it works
 
-There is **no existing "load a GitHub App ID + private key" system** in this runner today. What
-does already exist is adjacent infrastructure worth reusing as a foundation rather than building
-from scratch:
-
-| Existing component | What it actually does | Reusable for this feature? |
-| --- | --- | --- |
-| `RSAFileKeyManager` / `RSAEncryptedFileKeyManager` (`src/Runner.Listener/Configuration/`) | Stores the **runner's own** RSA keypair used during runner *registration* (proving the runner's identity to the Actions service). Linux/macOS: plain file + `chmod 600`. Windows: DPAPI-encrypted file. | **Yes, as a pattern to mirror** for how the GitHub App private key file is protected at rest. Not a literal loader for App keys — a different keypair, different purpose — but the exact secure-storage convention we should copy. |
-| `GitHub.Services.WebApi.Jwt.JsonWebToken` (`src/Sdk/WebApi/WebApi/Jwt/`) | General-purpose RS256 JWT builder, but requires an `Audience` claim and is shaped for VSTS/Azure DevOps-style tokens. | **Not a good fit as-is.** GitHub App JWTs don't use an audience and have a fixed 10-minute max lifetime. Cheaper/cleaner to hand-roll the ~20 lines of JWT construction directly with `System.Security.Cryptography.RSA` than to fight this class's assumptions. |
-| `IProcessChannel` IPC between `Runner.Listener` and `Runner.Worker` (`JobDispatcher.cs`) | Already carries the job message, secrets, and (recently) `ActionsDependencies` from Listener to Worker. | Not used by the implemented approach — only relevant if you later move token-minting into `Runner.Listener`. See [secure_app_id_listener_option.md](secure_app_id_listener_option.md). |
-
-So: nothing to "turn on," but nothing to invent from zero either. The implemented approach builds
-on the existing secure-file-storage convention above.
-
-## Process architecture context
-
-Two different "listener" concepts are easy to conflate, so it's worth being explicit — this is
-also what makes the alternative design in
-[secure_app_id_listener_option.md](secure_app_id_listener_option.md) viable.
-
-- **ARC's scale-set listener** (`gha-runner-scale-set-listener`) is a separate component from a
-  separate repo (`actions-runner-controller`, written in Go). It runs in its own pod, polls GitHub
-  for queued-job counts, and asks Kubernetes to spin up ephemeral runner pods. It contains none of
-  this repo's source and never runs workflow code.
-- **This repo's `Runner.Listener`** (`src/Runner.Listener`) is a different thing that happens to
-  share the word "listener." It runs *inside* each runner pod/VM, registers with the Actions
-  service, claims job messages, and — critically — never executes workflow-authored code itself.
-- **`Runner.Worker`** (`src/Runner.Worker`) is spawned by `Runner.Listener` as a **separate OS
-  process**, once per job, over a named-pipe IPC (`IProcessChannel`). It's the process that
-  actually runs steps/actions/scripts — the untrusted-code-execution surface.
-
-The container image ARC uses (built via [images/Dockerfile](../../images/Dockerfile)) packages
-both `Runner.Listener` and `Runner.Worker` binaries into one image, but they still run as two
-separate processes at runtime, exactly like a bare VM install.
+Inside each runner pod two processes run: `Runner.Listener` (registers with the server and claims
+jobs; never runs workflow code) and `Runner.Worker` (spawned per job; runs the job's steps — the
+untrusted-code surface). This feature runs in `Runner.Worker`. ARC's own scale-set listener is a
+separate component in a separate pod and repo, and isn't involved here.
 
 ```mermaid
-flowchart TB
-    subgraph GHE["kaiser.ghe.com (GHE instance the runner is registered to)"]
-        Queue[Job queue / Actions service]
+flowchart LR
+    ARC["ARC listener pod<br/>(scales runners up/down)"] --> Pod
+    subgraph Pod["Runner pod (one per job)"]
+        Listener["Runner.Listener<br/>(never runs workflow code)"]
+        Worker["Runner.Worker<br/>(runs the job's steps)"]
+        Listener --- Worker
     end
-
-    subgraph K8s["Kubernetes cluster"]
-        subgraph ScaleSetPod["gha-runner-scale-set-listener pod<br/>(separate repo: actions-runner-controller, written in Go)"]
-            ARCListener["ARC scale-set listener<br/>polls queued-job count,<br/>never runs workflow code"]
-        end
-
-        Controller["ARC controller<br/>creates/destroys ephemeral runner pods"]
-
-        subgraph RunnerPod["Ephemeral runner pod (per job)<br/>image built from THIS repo's Dockerfile"]
-            direction TB
-            Listener["Runner.Listener process<br/>(src/Runner.Listener, this repo)<br/>registers, claims job,<br/>never runs workflow code"]
-            Worker["Runner.Worker process<br/>(src/Runner.Worker, this repo)<br/>spawned per job by Listener,<br/>runs steps/actions/scripts"]
-            Listener <-->|"IPC over named pipe<br/>(IProcessChannel)"| Worker
-        end
-    end
-
-    Queue -->|"1. poll queue depth"| ARCListener
-    ARCListener -->|"2. request scale-up"| Controller
-    Controller -->|"3. create pod"| RunnerPod
-    Listener -->|"4. claim specific job message"| Queue
-    Worker -->|"5. download actions,<br/>run steps"| Internet(("actions/repos on<br/>github.com, kaiser.ghe.com,<br/>or a custom uses: host"))
+    Worker --> Hosts(("Action hosts:<br/>github.com, kaiser.ghe.com,<br/>or a custom uses: host"))
 ```
 
-In ARC's ephemeral mode, a runner pod (and so `Runner.Listener` within it) typically lives for only
-one job before being torn down — it isn't "long-lived across many jobs" the way a persistent
-VM-installed runner's Listener is. That said, `Runner.Listener` never executes workflow code
-either way, regardless of pod lifetime — which is exactly what makes the alternative design in
-[secure_app_id_listener_option.md](secure_app_id_listener_option.md) viable if you want the App
-private key out of the Worker process entirely.
-
-### Custom `uses:` URL + cross-host token flow (as implemented)
+When a step references a custom-host action, the token flow is:
 
 ```mermaid
 sequenceDiagram
-    participant WF as Workflow step<br/>uses: https://github.kp.org/owner/repo@ref
-    participant W as Runner.Worker process
-    participant AL as Allow-list<br/>(loaded at Worker startup<br/>from ACTIONS_RUNNER_CROSS_HOST_APPS_DIR)
-    participant KP as github.kp.org<br/>(App JWT endpoints)
-    participant DL as github.kp.org<br/>(tarball/zipball download)
+    participant Step as Workflow step
+    participant Runner as Runner.Worker
+    participant Host as Custom host (github.kp.org)
 
-    Note over W,AL: Job startup: scan folder, load host allow-list into memory
-    WF->>W: uses: parsed → host=github.kp.org, owner/repo, ref
-    W->>AL: is github.kp.org allow-listed?
-    alt host allow-listed
-        AL-->>W: yes — appId, privateKeyPath, installationId
-        W->>W: build+sign App JWT (RS256, exp<=10min)<br/>dispose RSA key material immediately
-        W->>KP: POST /app/installations/{id}/access_tokens<br/>Authorization: Bearer {jwt}
-        KP-->>W: installation token (~1hr) + expires_at
-        W->>W: SecretMasker.AddValue(token)
-        W->>DL: GET tarball<br/>Authorization: Bearer {installation token}
-        DL-->>W: action archive
-    else host NOT allow-listed
-        AL-->>W: no
-        W->>DL: GET tarball (anonymous, no token)
-        DL-->>W: archive (public repo) or 401/404
+    Step->>Runner: uses: https://github.kp.org/owner/repo@ref
+    Runner->>Runner: host + owner on the allow-list?
+    alt allow-listed
+        Runner->>Host: sign App JWT, exchange for installation token
+        Host-->>Runner: short-lived token (~1h)
+        Runner->>Host: download action (Bearer token)
+    else not allow-listed
+        Runner->>Host: download action (anonymous)
     end
 ```
 
-The primary `GITHUB_TOKEN` never appears anywhere in this flow — that's the fix for the
-credential-leak issue described above. A stronger-isolation alternative that mints in
-`Runner.Listener` instead exists as a documented (not implemented) option; see
-[secure_app_id_listener_option.md](secure_app_id_listener_option.md) if you want to compare the
-trade-offs.
+Three properties make this safe:
+
+- **Default-deny** — only allow-listed host/owner pairs get a token; everything else is anonymous,
+  and the job's own `GITHUB_TOKEN` is never sent to another host.
+- **Short-lived, scoped tokens** — the credential that authenticates the download is a GitHub App
+  *installation* token (~1 hour, scoped to that App's install), not a long-lived secret.
+- **The private key only signs, never travels** — it's read, used to sign a ~9-minute JWT, and the
+  in-memory key is disposed immediately; it never goes over the network.
+
+The key does live in `Runner.Worker` while it signs. To keep it out of the process that runs
+workflow code entirely, see [Protecting the private key further](#protecting-the-private-key-further).
 
 ## Config format and token-minting flow
 
@@ -354,6 +298,45 @@ for the remainder of that job (the Worker process is per-job, so no cross-job ca
 - `src/Test/L0/Worker/CrossHostAppTokenProviderL0.cs` — unit tests (unlisted host, missing key
   file, explicit `installationId`, dynamic installation lookup, no-installation-found error, token
   caching).
+
+## Protecting the private key further
+
+The default setup stores the App private key as a `chmod 600` PEM file readable by the runner
+service account. That's enough when the runner and the workflow code running on it share a trust
+boundary. It is **not** enough if the key must stay unreadable even to the workflow author whose
+steps run on the runner.
+
+Encrypting the PEM "at rest" on its own does not achieve that: whatever the runner can decrypt in
+order to sign with, code running in the same process/pod can also reach. Real protection comes from
+*where the key lives and who can invoke it*, not from encrypting a file the runner later decrypts
+in place. In increasing order of strength:
+
+1. **Isolate workflow code from the key (do this regardless).** In ARC, run jobs in
+   `containerMode: kubernetes` (or dind) so each job's steps execute in a separate container, and
+   mount the PEM only into the runner/agent container — never the job container. A `run:` step then
+   physically cannot `cat` the key file.
+2. **Mint in `Runner.Listener`, not `Runner.Worker`.** `Runner.Listener` never executes
+   workflow-authored code, so if the key lives only there and only the short-lived token crosses to
+   the Worker, workflow code never sees the key at all. See
+   [secure_app_id_listener_option.md](secure_app_id_listener_option.md).
+3. **Bind decryption to the pod's identity.** Store the PEM in a Kubernetes Secret encrypted at
+   rest in etcd (a KMS `EncryptionConfiguration`), or deliver it via Sealed Secrets / SOPS /
+   External Secrets so only your cluster's controller can decrypt it into a Secret. A stolen
+   encrypted blob is then useless off-cluster. (This protects the key in storage, backups, and Git
+   — not from a process inside the pod — so combine it with 1 or 2.)
+4. **Never expose the key at all — sign in a KMS/HSM.** Instead of storing an RSA private key
+   (even encrypted), keep it in a cloud KMS/HSM (e.g. Azure Key Vault, AWS KMS, GCP KMS) and ask
+   the KMS to *sign* the App JWT. The private key never exists in any pod; the runner authenticates
+   to the KMS as its Kubernetes workload identity (Workload Identity Federation), so only pods in
+   your cluster with that identity can invoke the sign operation. A user who copies the config
+   can't sign — there is no key file to copy, and they can't assume the pod identity. This is the
+   strongest answer to "only our runners can use it, the user can never see it," and the
+   recommended target if that's a hard requirement. It needs a code change (call the KMS sign API
+   instead of `RSA.SignData`) that this fork does not yet implement.
+
+The allow-list JSON itself carries no secrets — App IDs, installation IDs, and file paths, with the
+key mandated to a separate PEM file — so it does not need encryption; standard file permissions are
+sufficient.
 
 ## Alternatives considered and rejected
 
