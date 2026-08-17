@@ -74,8 +74,9 @@ EOF
 ```
 
 If different orgs on the same host use different GitHub Apps, add an `orgs` list to that host
-entry — each owner gets its own `appId`/`privateKeyPath`/`installationId`, and the host-level
-fields (if present) become the default for any owner not explicitly listed:
+entry — each owner gets its own `appId`/`privateKeyPath`, and the host-level fields (if present)
+become the default for any owner not explicitly listed. `installationId` is optional everywhere
+(host level or org level) — see the note below the example:
 
 ```json
 {
@@ -84,6 +85,7 @@ fields (if present) become the default for any owner not explicitly listed:
       "host": "github.kp.org",
       "appId": "123456",
       "privateKeyPath": "/etc/actions-runner/keys/default-app.pem",
+      "installationId": "789012",
       "orgs": [
         {
           "owner": "team-a",
@@ -94,7 +96,8 @@ fields (if present) become the default for any owner not explicitly listed:
         {
           "owner": "team-b",
           "appId": "444444",
-          "privateKeyPath": "/etc/actions-runner/keys/team-b-app.pem"
+          "privateKeyPath": "/etc/actions-runner/keys/team-b-app.pem",
+          "installationId": "555555"
         }
       ]
     }
@@ -111,9 +114,15 @@ fields (if present) become the default for any owner not explicitly listed:
   throws a clear error naming the owner and host, but doesn't affect other owners or the host
   default.
 
-Omit `installationId` if you'd rather it be resolved dynamically per-owner at mint time (useful if
-the App is installed across many orgs on that host). No runner restart is required beyond the next
-job — the allow-list is loaded once per `Runner.Worker` process (i.e., once per job).
+`installationId` is **never required** — it's the same optional field at both the host level and
+inside each `orgs` entry, and behaves identically either way: if you omit it (at any level),
+`CrossHostAppTokenProvider` resolves it dynamically via `GET /app/installations`, matching the
+`uses:` owner against `account.login`. Setting it explicitly just skips that extra lookup call —
+worth doing if you want one less API round-trip per mint, or don't want the runner calling an
+endpoint that lists every org/account the App is installed on. There's no case where one entry
+needs it and a sibling one doesn't; it's purely optional everywhere, independent of what else is
+configured around it. No runner restart is required beyond the next job — the allow-list is
+loaded once per `Runner.Worker` process (i.e., once per job).
 
 ### 4. Reference it from a workflow
 
