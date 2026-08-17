@@ -626,7 +626,7 @@ namespace GitHub.DistributedTask.Pipelines.ObjectTemplating
                         Path = usesString.Value
                     };
                 }
-                else if (PipelineConstants.TryParseSelfRepository(uses.Value, out var selfPath))
+                else if (PipelineConstants.TryParseSelfRepository(usesString.Value, out var selfPath))
                 {
                     result.Reference = new RepositoryPathReference
                     {
