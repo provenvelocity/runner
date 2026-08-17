@@ -11,11 +11,13 @@ using System.Threading;
 using System.Threading.Tasks;
 using GitHub.DistributedTask.WebApi;
 using GitHub.Runner.Common;
+using GitHub.Runner.Common.Util;
 using GitHub.Runner.Sdk;
 using Microsoft.DevTunnels.Connections;
 using Microsoft.DevTunnels.Contracts;
 using Microsoft.DevTunnels.Management;
 using Newtonsoft.Json;
+using Pipelines = GitHub.DistributedTask.Pipelines;
 
 namespace GitHub.Runner.Worker.Dap
 {
@@ -27,6 +29,7 @@ namespace GitHub.Runner.Worker.Dap
         public string DisplayName { get; set; }
         public TaskResult? Result { get; set; }
         public int FrameId { get; set; }
+        public int? SourceLine { get; set; }
     }
 
     /// <summary>
@@ -54,6 +57,9 @@ namespace GitHub.Runner.Worker.Dap
         // Frame IDs for completed steps start at 1000
         private const int _completedFrameIdBase = 1000;
 
+        // Stable session-scoped source reference for the synthesized job step list.
+        private const int _jobStepsSourceReference = 1;
+
         private TcpListener _listener;
         private TcpClient _client;
         private NetworkStream _stream;
@@ -63,10 +69,19 @@ namespace GitHub.Runner.Worker.Dap
         private volatile DapSessionState _state = DapSessionState.NotStarted;
         private CancellationTokenRegistration? _cancellationRegistration;
         private bool _isFirstStep = true;
+        private bool _welcomeMessageSent;
 
         // Dev Tunnel relay host for remote debugging
         private TunnelRelayTunnelHost _tunnelRelayHost;
         private IWebSocketDapBridge _webSocketBridge;
+
+        // Set before we intentionally tear the Dev Tunnel down so the relay
+        // disconnect that teardown produces isn't mistaken for a failure.
+        private volatile bool _tunnelShuttingDown;
+
+        // 0 until an unexpected tunnel disconnect has been reported, so the job
+        // is only failed once no matter how many status changes we observe.
+        private int _tunnelFailureReported;
 
         // Cancellation source for the connection loop, cancelled in StopAsync
         // so AcceptTcpClientAsync unblocks cleanly without relying on listener disposal.
@@ -78,6 +93,10 @@ namespace GitHub.Runner.Worker.Dap
         // When true, skip the public websocket bridge and expose the raw DAP
         // listener directly on the configured tunnel port (unit tests only).
         internal bool SkipWebSocketBridge { get; set; }
+
+        // Invoked once the tunnel relay is up, so tests can simulate a relay drop
+        // that lands while startup is still in progress (unit tests only).
+        internal Action TunnelRelayStarted { get; set; }
 
         // Synchronization for step execution
         private TaskCompletionSource<DapCommand> _commandTcs;
@@ -97,6 +116,8 @@ namespace GitHub.Runner.Worker.Dap
         // Track completed steps for stack trace
         private readonly List<CompletedStepInfo> _completedSteps = new List<CompletedStepInfo>();
         private int _nextCompletedFrameId = _completedFrameIdBase;
+        private JobExecutionView _jobStepsSource;
+        private bool _jobCompleted;
 
         // Client connection tracking for reconnection support
         private volatile bool _isClientConnected;
@@ -137,6 +158,8 @@ namespace GitHub.Runner.Worker.Dap
             Trace.Info($"Starting DAP debugger on port {debuggerConfig.Tunnel.Port}");
 
             _jobContext = jobContext;
+            _tunnelShuttingDown = false;
+            Interlocked.Exchange(ref _tunnelFailureReported, 0);
             _readyTcs = new TaskCompletionSource<bool>(TaskCreationOptions.RunContinuationsAsynchronously);
 
             var dapPort = SkipWebSocketBridge ? debuggerConfig.Tunnel.Port : 0;
@@ -162,7 +185,27 @@ namespace GitHub.Runner.Worker.Dap
                 await StartTunnelRelayAsync(debuggerConfig);
             }
 
-            _state = DapSessionState.WaitingForConnection;
+            TunnelRelayStarted?.Invoke();
+
+            // The relay can drop while we're still starting up, which terminates the
+            // session and reports the failure. Don't resurrect it or start listening
+            // for a client that has no way to reach us.
+            bool terminatedDuringStartup;
+            lock (_stateLock)
+            {
+                terminatedDuringStartup = _state == DapSessionState.Terminated;
+                if (!terminatedDuringStartup)
+                {
+                    _state = DapSessionState.WaitingForConnection;
+                }
+            }
+
+            if (terminatedDuringStartup)
+            {
+                Trace.Info("Debugger tunnel dropped during startup, skipping connection loop.");
+                return;
+            }
+
             _loopCts = CancellationTokenSource.CreateLinkedTokenSource(jobContext.CancellationToken);
             _connectionLoopTask = ConnectionLoopAsync(_loopCts.Token);
 
@@ -208,9 +251,141 @@ namespace GitHub.Runner.Worker.Dap
             var tunnelConnectTimeoutSeconds = ResolveTunnelConnectTimeout();
             using var connectCts = new CancellationTokenSource(TimeSpan.FromSeconds(tunnelConnectTimeoutSeconds));
             Trace.Info($"Connecting to Dev Tunnel relay (timeout: {tunnelConnectTimeoutSeconds}s)");
-            await _tunnelRelayHost.ConnectAsync(tunnel, connectCts.Token);
+
+            try
+            {
+                await _tunnelRelayHost.ConnectAsync(tunnel, connectCts.Token);
+            }
+            catch (OperationCanceledException) when (_jobContext?.CancellationToken.IsCancellationRequested == true)
+            {
+                // The job itself is going away — not a tunnel problem.
+                throw;
+            }
+            catch (OperationCanceledException ex) when (connectCts.IsCancellationRequested)
+            {
+                throw new DebuggerTunnelException(
+                    $"Timed out after {tunnelConnectTimeoutSeconds} seconds while connecting to the debugger tunnel.",
+                    ex);
+            }
+            catch (Exception ex)
+            {
+                throw new DebuggerTunnelException(
+                    $"Failed to connect to the debugger tunnel: {ex.Message}",
+                    ex);
+            }
+
+            // Only watch for drops once we're actually connected. A failure during the
+            // initial connect surfaces as the DebuggerTunnelException above, so watching
+            // earlier would just report the same failure twice.
+            _tunnelRelayHost.ConnectionStatusChanged += OnTunnelConnectionStatusChanged;
+
+            // Close the (tiny) window between ConnectAsync returning and the handler
+            // being attached, during which a drop would go unnoticed.
+            HandleTunnelConnectionStatusChanged(_tunnelRelayHost.ConnectionStatus, _tunnelRelayHost.DisconnectException);
 
             Trace.Info("Dev Tunnel relay started");
+        }
+
+        private void OnTunnelConnectionStatusChanged(object sender, ConnectionStatusChangedEventArgs e)
+        {
+            HandleTunnelConnectionStatusChanged(e.Status, e.DisconnectException);
+        }
+
+        /// <summary>
+        /// Reacts to Dev Tunnel relay connection status changes. The Dev Tunnel SDK
+        /// reconnects on its own, so transient drops show up as <c>Connecting</c> and
+        /// only a settled <c>Disconnected</c> means the relay is really gone.
+        /// </summary>
+        internal void HandleTunnelConnectionStatusChanged(ConnectionStatus status, Exception disconnectException)
+        {
+            try
+            {
+                Trace.Info($"Dev Tunnel relay connection status: {status}");
+
+                if (status != ConnectionStatus.Disconnected)
+                {
+                    return;
+                }
+
+                if (_tunnelShuttingDown)
+                {
+                    Trace.Info("Dev Tunnel relay disconnected while shutting down — expected, ignoring.");
+                    return;
+                }
+
+                ReportTunnelDisconnected(disconnectException);
+            }
+            catch (Exception ex)
+            {
+                // This runs on a Dev Tunnel SDK callback thread — never let it throw.
+                Trace.Error($"Error handling Dev Tunnel connection status change: {ex.Message}");
+                Trace.Error(ex);
+            }
+        }
+
+        /// <summary>
+        /// Fails the job when the debugger's tunnel drops unexpectedly. Without the
+        /// tunnel the debug client can never resume the job, so anything waiting on a
+        /// DAP pause would hang until the job timeout — fail fast instead.
+        /// </summary>
+        private void ReportTunnelDisconnected(Exception disconnectException)
+        {
+            if (Interlocked.Exchange(ref _tunnelFailureReported, 1) != 0)
+            {
+                return;
+            }
+
+            IExecutionContext jobContext;
+            lock (_stateLock)
+            {
+                jobContext = _jobContext;
+            }
+
+            var detail = string.IsNullOrEmpty(disconnectException?.Message)
+                ? string.Empty
+                : $" {disconnectException.Message}";
+            var message = $"The debugger lost its connection to the tunnel and the job cannot continue.{detail}";
+            Trace.Error(message);
+
+            if (jobContext != null)
+            {
+                // A disconnect can land at any point in the job, including outside a step
+                // record, so set the category directly rather than relying on an issue
+                // being flushed by a step completing.
+                if (string.IsNullOrEmpty(jobContext.Global.InfrastructureFailureCategory))
+                {
+                    jobContext.Global.InfrastructureFailureCategory = Constants.Runner.InfrastructureFailureCategories.DebuggerTunnelFailure;
+                }
+
+                jobContext.InfrastructureError(message, category: Constants.Runner.InfrastructureFailureCategories.DebuggerTunnelFailure);
+                jobContext.Result = TaskResultUtil.MergeTaskResults(jobContext.Result, TaskResult.Failed);
+                if (jobContext.JobContext != null)
+                {
+                    jobContext.JobContext.Status = jobContext.Result?.ToActionResult();
+                }
+
+                jobContext.Global.JobTelemetry?.Add(new JobTelemetry
+                {
+                    Type = JobTelemetryType.General,
+                    Message = "DebuggerConnectionResult: TunnelDisconnected"
+                });
+            }
+
+            // Unblock anything waiting on the debug client so the job stops waiting.
+            var readyTcs = _readyTcs;
+            if (readyTcs?.TrySetException(new DebuggerTunnelException(message)) == true)
+            {
+                // Make sure the fault is observed even when nothing is awaiting it.
+                _ = readyTcs.Task.ContinueWith(static t => _ = t.Exception, TaskContinuationOptions.OnlyOnFaulted);
+            }
+
+            lock (_stateLock)
+            {
+                _state = DapSessionState.Terminated;
+                _commandTcs?.TrySetResult(DapCommand.Disconnect);
+            }
+
+            HandleClientDisconnected();
         }
 
         public async Task WaitUntilReadyAsync()
@@ -239,10 +414,208 @@ namespace GitHub.Runner.Worker.Dap
             }
         }
 
+        public Task OnJobStepsInitializedAsync(IEnumerable<IStep> steps, IEnumerable<IStep> initialPostSteps)
+        {
+            if (!IsActive)
+            {
+                return Task.CompletedTask;
+            }
+
+            try
+            {
+                IExecutionContext jobContext;
+                lock (_stateLock)
+                {
+                    if (_state != DapSessionState.Ready &&
+                        _state != DapSessionState.Paused &&
+                        _state != DapSessionState.Running)
+                    {
+                        return Task.CompletedTask;
+                    }
+
+                    jobContext = _jobContext;
+                }
+
+                var stepList = steps?.Where(step => step != null).ToList() ?? new List<IStep>();
+                var initialPostStepList = initialPostSteps?.Where(step => step != null).ToList() ?? new List<IStep>();
+                var jobId = jobContext?.GetGitHubContext("job");
+                var snapshot = new JobExecutionView(
+                    jobId,
+                    stepList,
+                    initialPostStepList,
+                    PredictPostSteps(jobContext, stepList, initialPostStepList));
+
+                lock (_stateLock)
+                {
+                    _jobStepsSource = snapshot;
+                    _jobCompleted = false;
+                }
+                Trace.Info("DAP job steps source initialized");
+            }
+            catch (Exception ex)
+            {
+                Trace.Warning("DAP OnJobStepsInitialized error.");
+                Trace.Error(ex);
+            }
+
+            return Task.CompletedTask;
+        }
+
+        public void OnPostStepRegistered(IStep step)
+        {
+            try
+            {
+                if (step is IActionRunner postRunner && postRunner.Action != null)
+                {
+                    JobExecutionView snapshot;
+                    lock (_stateLock)
+                    {
+                        snapshot = _jobStepsSource;
+                    }
+
+                    var line = snapshot?.TryClaimPredictedStep(MatchKeyFor(postRunner.Action.Id), step);
+                    if (line.HasValue)
+                    {
+                        Trace.Info($"DAP job steps source claimed predicted post step '{step.DisplayName}' at line {line.Value}.");
+                    }
+                    else
+                    {
+                        Trace.Info($"DAP job steps source had no predicted line for post step '{step.DisplayName}'.");
+                    }
+                }
+            }
+            catch (Exception ex)
+            {
+                Trace.Warning("DAP OnPostStepRegistered error.");
+                Trace.Error(ex);
+            }
+        }
+
+        private IReadOnlyList<JobExecutionView.PredictedPostStep> PredictPostSteps(
+            IExecutionContext jobContext,
+            IReadOnlyList<IStep> steps,
+            IReadOnlyList<IStep> initialPostSteps)
+        {
+            if (jobContext == null || steps == null || steps.Count == 0)
+            {
+                return Array.Empty<JobExecutionView.PredictedPostStep>();
+            }
+
+            IActionManager actionManager;
+            try
+            {
+                actionManager = HostContext.GetService<IActionManager>();
+            }
+            catch (Exception ex)
+            {
+                Trace.Info($"DAP post-step predictor skipped because IActionManager is unavailable ({ex.Message}).");
+                return Array.Empty<JobExecutionView.PredictedPostStep>();
+            }
+
+            var predictions = new List<JobExecutionView.PredictedPostStep>();
+            var seenActionIds = new HashSet<Guid>();
+            if (initialPostSteps != null)
+            {
+                foreach (var postStep in initialPostSteps)
+                {
+                    if (postStep is IActionRunner postRunner && postRunner.Action != null)
+                    {
+                        seenActionIds.Add(postRunner.Action.Id);
+                    }
+                }
+            }
+
+            foreach (var step in steps)
+            {
+                if (step is not IActionRunner runner ||
+                    runner.Stage == ActionRunStage.Post ||
+                    runner.Action == null)
+                {
+                    continue;
+                }
+
+                var action = runner.Action;
+                if (action.Reference is not Pipelines.RepositoryPathReference repoRef)
+                {
+                    continue;
+                }
+
+                if (!seenActionIds.Add(action.Id))
+                {
+                    continue;
+                }
+
+                Definition definition;
+                try
+                {
+                    definition = actionManager.LoadAction(jobContext, action);
+                }
+                catch (Exception ex)
+                {
+                    Trace.Info($"DAP post-step predictor could not load action '{repoRef.Name}' ({ex.Message}).");
+                    continue;
+                }
+
+                if (definition?.Data?.Execution?.HasPost != true)
+                {
+                    continue;
+                }
+
+                predictions.Add(new JobExecutionView.PredictedPostStep(
+                    GetPostDisplayName(runner),
+                    MatchKeyFor(action.Id)));
+            }
+
+            predictions.Reverse();
+            return predictions;
+        }
+
+        private static string GetPostDisplayName(IActionRunner runner)
+        {
+            var displayName = string.IsNullOrEmpty(runner.DisplayName) ? "step" : runner.DisplayName;
+            if (runner.Stage == ActionRunStage.Pre &&
+                displayName.StartsWith("Pre ", StringComparison.OrdinalIgnoreCase))
+            {
+                displayName = displayName.Substring("Pre ".Length);
+            }
+
+            return $"Post {displayName}";
+        }
+
+        private static string MatchKeyFor(Guid actionId)
+        {
+            return $"post:{actionId:N}";
+        }
+
         public async Task OnJobCompletedAsync()
         {
             if (_state != DapSessionState.NotStarted)
             {
+                // Pause so the user can inspect final job state before we tear down,
+                // but only if the user was stepping through (not if they hit continue).
+                if (IsActive && _pauseOnNextStep)
+                {
+                    try
+                    {
+                        if (_jobContext != null)
+                        {
+                            Trace.Info("Job completed — pausing for inspection");
+                            lock (_stateLock)
+                            {
+                                _jobCompleted = true;
+                            }
+
+                            SendStoppedEvent("completed", "Job completed — inspect variables before the session ends.");
+
+                            await WaitForCommandAsync(_jobContext.CancellationToken);
+                        }
+                    }
+                    catch (Exception ex)
+                    {
+                        Trace.Warning($"DAP job-completed pause error: {ex.Message}");
+                    }
+                }
+
                 try
                 {
                     OnJobCompleted();
@@ -252,12 +625,14 @@ namespace GitHub.Runner.Worker.Dap
                     Trace.Warning($"DAP OnJobCompleted error: {ex.Message}");
                 }
             }
-
-            await StopAsync();
         }
 
         public async Task StopAsync()
         {
+            // Everything from here on is deliberate teardown, so any relay disconnect
+            // it produces is expected and must not be reported as an infra failure.
+            _tunnelShuttingDown = true;
+
             if (_cancellationRegistration.HasValue)
             {
                 _cancellationRegistration.Value.Dispose();
@@ -277,6 +652,7 @@ namespace GitHub.Runner.Worker.Dap
                 if (_tunnelRelayHost != null)
                 {
                     Trace.Info("Stopping Dev Tunnel relay");
+                    _tunnelRelayHost.ConnectionStatusChanged -= OnTunnelConnectionStatusChanged;
                     var disposeTask = _tunnelRelayHost.DisposeAsync().AsTask();
                     if (await Task.WhenAny(disposeTask, Task.Delay(10_000)) != disposeTask)
                     {
@@ -340,6 +716,7 @@ namespace GitHub.Runner.Worker.Dap
                 {
                     _state = DapSessionState.Terminated;
                 }
+                _jobStepsSource = null;
             }
 
             _isClientConnected = false;
@@ -398,7 +775,8 @@ namespace GitHub.Runner.Worker.Dap
                     {
                         DisplayName = step.DisplayName,
                         Result = result,
-                        FrameId = _nextCompletedFrameId++
+                        FrameId = _nextCompletedFrameId++,
+                        SourceLine = _jobStepsSource?.TryGetLineForStep(step)
                     });
                 }
             }
@@ -449,6 +827,7 @@ namespace GitHub.Runner.Worker.Dap
                         "next" => HandleNext(request),
                         "setBreakpoints" => HandleSetBreakpoints(request),
                         "setExceptionBreakpoints" => HandleSetExceptionBreakpoints(request),
+                        "source" => HandleSource(request),
                         "completions" => HandleCompletions(request),
                         "stepIn" => CreateResponse(request, false, "Step In is not supported. Actions jobs debug at the step level - use 'next' to advance to the next step.", body: null),
                         "stepOut" => CreateResponse(request, false, "Step Out is not supported. Actions jobs debug at the step level - use 'continue' to resume.", body: null),
@@ -472,6 +851,11 @@ namespace GitHub.Runner.Worker.Dap
                     });
                     Trace.Info("Sent initialized event");
                 }
+
+                if (request.Command == "configurationDone")
+                {
+                    SendWelcomeMessage();
+                }
             }
             catch (Exception ex)
             {
@@ -490,6 +874,7 @@ namespace GitHub.Runner.Worker.Dap
         internal void HandleClientConnected()
         {
             _isClientConnected = true;
+            _welcomeMessageSent = false;
             Trace.Info("Client connected to debug session");
 
             // If we're paused, re-send the stopped event so the new client
@@ -800,10 +1185,41 @@ namespace GitHub.Runner.Worker.Dap
             });
         }
 
+        internal void SendWelcomeMessage()
+        {
+            if (_welcomeMessageSent)
+            {
+                return;
+            }
+            _welcomeMessageSent = true;
+
+            var debuggerConfig = _jobContext?.Global?.Debugger;
+            if (debuggerConfig?.OverrideWelcomeMessage == true)
+            {
+                if (!string.IsNullOrEmpty(debuggerConfig.WelcomeMessage))
+                {
+                    // The welcome message is server-supplied and never rendered verbatim:
+                    // mask secrets and strip control characters before it reaches the console.
+                    SendOutput("console", SanitizeConsoleText(MaskUserVisibleText(debuggerConfig.WelcomeMessage)));
+                    Trace.Info("Sent custom welcome message");
+                }
+                else
+                {
+                    Trace.Info("Welcome message suppressed by override");
+                }
+            }
+            else
+            {
+                SendOutput("console", DapReplParser.GetGeneralHelp());
+                Trace.Info("Sent default welcome message");
+            }
+        }
+
         internal async Task OnStepStartingAsync(IStep step, bool isFirstStep)
         {
             bool pauseOnNextStep;
             CancellationToken cancellationToken;
+
             lock (_stateLock)
             {
                 if (_state != DapSessionState.Ready &&
@@ -815,6 +1231,7 @@ namespace GitHub.Runner.Worker.Dap
 
                 _currentStep = step;
                 _currentStepIndex = _completedSteps.Count;
+                _jobCompleted = false;
                 pauseOnNextStep = _pauseOnNextStep;
                 cancellationToken = _jobContext?.CancellationToken ?? CancellationToken.None;
             }
@@ -841,6 +1258,9 @@ namespace GitHub.Runner.Worker.Dap
 
             // Send stopped event to debugger (only if client is connected)
             SendStoppedEvent(reason, description);
+
+            // Emit a banner so the user knows where REPL commands will execute
+            SendExecutionContextBanner();
 
             // Wait for debugger command
             await WaitForCommandAsync(cancellationToken);
@@ -994,29 +1414,46 @@ namespace GitHub.Runner.Worker.Dap
         private Response HandleStackTrace(Request request)
         {
             IStep currentStep;
-            int currentStepIndex;
             CompletedStepInfo[] completedSteps;
+            JobExecutionView jobStepsSource;
+            bool jobCompleted;
             lock (_stateLock)
             {
                 currentStep = _currentStep;
-                currentStepIndex = _currentStepIndex;
                 completedSteps = _completedSteps.ToArray();
+                jobStepsSource = _jobStepsSource;
+                jobCompleted = _jobCompleted;
             }
 
             var frames = new List<StackFrame>();
+            var source = jobStepsSource != null ? BuildJobStepsSource(jobStepsSource) : null;
 
             // Add current step as the top frame
-            if (currentStep != null)
+            if (jobCompleted && jobStepsSource != null)
+            {
+                frames.Add(new StackFrame
+                {
+                    Id = _currentFrameId,
+                    Name = "Complete job [completed]",
+                    Source = source,
+                    Line = jobStepsSource.CompleteJobLine,
+                    Column = 1,
+                    PresentationHint = "normal"
+                });
+            }
+            else if (currentStep != null)
             {
                 var resultIndicator = currentStep.ExecutionContext?.Result != null
                     ? $" [{currentStep.ExecutionContext.Result}]"
                     : " [running]";
+                var currentSourceLine = jobStepsSource?.TryGetLineForStep(currentStep);
 
                 frames.Add(new StackFrame
                 {
                     Id = _currentFrameId,
                     Name = MaskUserVisibleText($"{currentStep.DisplayName ?? "Current Step"}{resultIndicator}"),
-                    Line = currentStepIndex + 1,
+                    Source = currentSourceLine.HasValue ? source : null,
+                    Line = currentSourceLine ?? 0,
                     Column = 1,
                     PresentationHint = "normal"
                 });
@@ -1042,7 +1479,8 @@ namespace GitHub.Runner.Worker.Dap
                 {
                     Id = completedStep.FrameId,
                     Name = MaskUserVisibleText($"{completedStep.DisplayName}{resultStr}"),
-                    Line = 1,
+                    Source = completedStep.SourceLine.HasValue ? source : null,
+                    Line = completedStep.SourceLine ?? 0,
                     Column = 1,
                     PresentationHint = "subtle"
                 });
@@ -1055,6 +1493,76 @@ namespace GitHub.Runner.Worker.Dap
             };
 
             return CreateResponse(request, true, body: body);
+        }
+
+        private Source BuildJobStepsSource(JobExecutionView snapshot)
+        {
+            return new Source
+            {
+                Name = MaskUserVisibleText(snapshot.SourceFileName),
+                Path = MaskUserVisibleText($"{SanitizeSourcePathSegment(snapshot.JobId)}/{snapshot.SourceFileName}"),
+                SourceReference = _jobStepsSourceReference,
+                PresentationHint = "normal"
+            };
+        }
+
+        private static string SanitizeSourcePathSegment(string value)
+        {
+            if (string.IsNullOrWhiteSpace(value))
+            {
+                return "job";
+            }
+
+            var builder = new StringBuilder(value.Length);
+            foreach (var character in value)
+            {
+                builder.Append(char.IsControl(character) || character == '/' || character == '\\'
+                    ? '_'
+                    : character);
+            }
+
+            return builder.Length == 0 ? "job" : builder.ToString();
+        }
+
+        internal Response HandleSource(Request request)
+        {
+            SourceArguments args;
+            try
+            {
+                args = request.Arguments?.ToObject<SourceArguments>();
+            }
+            catch (Exception ex)
+            {
+                Trace.Warning($"Failed to parse source arguments: {ex.GetType().Name}");
+                return CreateResponse(request, false, "Invalid source arguments.", body: null);
+            }
+
+            var sourceReference = args?.Source?.SourceReference ?? args?.SourceReference;
+            if (!sourceReference.HasValue)
+            {
+                return CreateResponse(request, false, "Missing source reference.", body: null);
+            }
+
+            JobExecutionView snapshot;
+            lock (_stateLock)
+            {
+                snapshot = _jobStepsSource;
+            }
+
+            if (snapshot == null)
+            {
+                return CreateResponse(request, false, "Job steps source not yet available.", body: null);
+            }
+
+            if (sourceReference.Value != _jobStepsSourceReference)
+            {
+                return CreateResponse(request, false, $"Unknown source reference: {sourceReference.Value}.", body: null);
+            }
+
+            return CreateResponse(request, true, body: new SourceResponseBody
+            {
+                Content = MaskUserVisibleText(snapshot.Content)
+            });
         }
 
         private Response HandleScopes(Request request)
@@ -1177,7 +1685,12 @@ namespace GitHub.Runner.Worker.Dap
 
                 case RunCommand run:
                     var context = GetExecutionContextForFrame(frameId);
-                    return await _replExecutor.ExecuteRunCommandAsync(run, context, cancellationToken);
+                    bool isActionStep;
+                    lock (_stateLock)
+                    {
+                        isActionStep = _currentStep is IActionRunner;
+                    }
+                    return await _replExecutor.ExecuteRunCommandAsync(run, context, isActionStep, cancellationToken);
 
                 default:
                     return new EvaluateResponseBody
@@ -1302,6 +1815,13 @@ namespace GitHub.Runner.Worker.Dap
                 _commandTcs = new TaskCompletionSource<DapCommand>(TaskCreationOptions.RunContinuationsAsynchronously);
             }
 
+            // If cancellation already fired before we created the new TCS,
+            // the registration callback targeted the old one. Unblock now.
+            if (cancellationToken.IsCancellationRequested)
+            {
+                _commandTcs.TrySetResult(DapCommand.Disconnect);
+            }
+
             Trace.Info("Waiting for debugger command...");
 
             var command = await _commandTcs.Task;
@@ -1382,6 +1902,40 @@ namespace GitHub.Runner.Worker.Dap
             });
         }
 
+        /// <summary>
+        /// Emits a console output banner telling the user whether REPL
+        /// commands will execute on the host or inside the job container.
+        /// </summary>
+        private void SendExecutionContextBanner()
+        {
+            if (!_isClientConnected)
+            {
+                return;
+            }
+
+            bool isActionStep = _currentStep is IActionRunner;
+            var container = _jobContext?.Global?.Container;
+
+            string target;
+            if (isActionStep && container != null &&
+                (!string.IsNullOrEmpty(container.ContainerId) ||
+                 FeatureManager.IsContainerHooksEnabled(_jobContext?.Global?.Variables)))
+            {
+                var image = container.ContainerImage ?? "container";
+                var shortId = !string.IsNullOrEmpty(container.ContainerId) && container.ContainerId.Length >= 12
+                    ? container.ContainerId.Substring(0, 12)
+                    : container.ContainerId ?? "";
+                var idSuffix = !string.IsNullOrEmpty(shortId) ? $" ({shortId})" : "";
+                target = $"job container: {image}{idSuffix}";
+            }
+            else
+            {
+                target = "runner host";
+            }
+
+            SendOutput("console", $"\nCommands will run on {target}\n");
+        }
+
         private string MaskUserVisibleText(string value)
         {
             if (string.IsNullOrEmpty(value))
@@ -1390,6 +1944,30 @@ namespace GitHub.Runner.Worker.Dap
             }
 
             return HostContext?.SecretMasker?.MaskSecrets(value) ?? value;
+        }
+
+        /// <summary>
+        /// Removes C0/C1 control characters (except tab, carriage return and line feed) so
+        /// server-supplied text cannot inject ANSI escape sequences or terminal control codes
+        /// into the DAP console.
+        /// </summary>
+        internal static string SanitizeConsoleText(string value)
+        {
+            if (string.IsNullOrEmpty(value))
+            {
+                return value ?? string.Empty;
+            }
+
+            var builder = new StringBuilder(value.Length);
+            foreach (var character in value)
+            {
+                if (!char.IsControl(character) || character == '\t' || character == '\r' || character == '\n')
+                {
+                    builder.Append(character);
+                }
+            }
+
+            return builder.ToString();
         }
 
         /// <summary>
