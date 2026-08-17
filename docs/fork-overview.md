@@ -22,8 +22,9 @@ pushed *to* `provenvelocity/runner` (`fork`) and, for testing, `kaiser.ghe.com/a
 3. **Secure cross-host authentication** for the feature above — a default-deny allow-list of
    hosts, each backed by a GitHub App, so a token is only ever attached to a request when the
    target host is explicitly trusted (never the primary `GITHUB_TOKEN` forwarded to an arbitrary
-   host). See [docs/feature/secure_app_id.md](feature/secure_app_id.md) for the full design and a
-   step-by-step setup guide.
+   host). See [docs/feature/secure_app_id.md](feature/secure_app_id.md) for the setup guide, or
+   [docs/feature/secure_app_id_listener_option.md](feature/secure_app_id_listener_option.md) for a
+   stronger-isolation alternative that isn't implemented yet.
 4. **Automated upstream sync** — `.github/workflows/sync-upstream.yml` periodically merges
    `actions/runner`'s `main` (or latest stable tag, depending on the version of that workflow) into
    this branch, so the fork doesn't drift far behind upstream security/bug fixes.
