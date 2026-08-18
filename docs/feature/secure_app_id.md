@@ -3,6 +3,8 @@
 **Status**: Implemented (`src/Runner.Worker/CrossHostAppTokenProvider.cs`, commit `60b17d82`).
 A stronger-isolation alternative (mint tokens in `Runner.Listener` instead of `Runner.Worker`) is
 documented separately for future hardening: [secure_app_id_listener_option.md](secure_app_id_listener_option.md).
+A KMS-free bootstrap approach for delivering the private key only to the Listener is also
+documented separately: [secure_app_id_bootstrap_option.md](secure_app_id_bootstrap_option.md).
 
 **Related**: [docs/adrs/fork-0001-custom-uses-url.md](../adrs/fork-0001-custom-uses-url.md)
 
