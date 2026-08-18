@@ -267,61 +267,10 @@ namespace GitHub.Runner.Worker
                 return null;
             }
 
-            // Docker reference: docker://image:tag
-            if (uses.StartsWith("docker://", StringComparison.OrdinalIgnoreCase))
-            {
-                return new GitHub.DistributedTask.Pipelines.ContainerRegistryReference
-                {
-                    Image = uses.Substring("docker://".Length)
-                };
-            }
-
-            // Local path reference: ./path/to/action
-            if (uses.StartsWith("./") || uses.StartsWith(".\\"))
-            {
-                return new GitHub.DistributedTask.Pipelines.RepositoryPathReference
-                {
-                    RepositoryType = "self",
-                    Path = uses
-                };
-            }
-
-            // Repository reference: owner/repo@ref or owner/repo/path@ref
-            var atIndex = uses.LastIndexOf('@');
-            string refPart = null;
-            string repoPart = uses;
-
-            if (atIndex > 0)
-            {
-                refPart = uses.Substring(atIndex + 1);
-                repoPart = uses.Substring(0, atIndex);
-            }
-
-            // Split by / to get owner/repo and optional path
-            var parts = repoPart.Split('/');
-            string name;
-            string path = null;
-
-            if (parts.Length >= 2)
-            {
-                name = $"{parts[0]}/{parts[1]}";
-                if (parts.Length > 2)
-                {
-                    path = string.Join("/", parts, 2, parts.Length - 2);
-                }
-            }
-            else
-            {
-                name = repoPart;
-            }
-
-            return new GitHub.DistributedTask.Pipelines.RepositoryPathReference
-            {
-                RepositoryType = "GitHub",
-                Name = name,
-                Ref = refPart,
-                Path = path
-            };
+            // Shared with the legacy PipelineTemplateConverter so both parse uses: identically
+            // (docker://, ./local, $/ self-repository, fully-qualified http(s) URL, owner/repo[/path]@ref).
+            GitHub.DistributedTask.Pipelines.ActionReferenceBuilder.TryParse(uses, out var reference, out _);
+            return reference;
         }
 
         private T ConvertToLegacyToken<T>(GitHub.Actions.WorkflowParser.ObjectTemplating.Tokens.TemplateToken newToken) where T : TemplateToken
